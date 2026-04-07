@@ -21,7 +21,7 @@
 **条件**: 执行 `bun run dev -- --bg`
 **行为**: `scripts/dev.mjs` 以守护进程模式拉起开发服务，并记录 `.dev/dev-runner.json`
 **结果**: 可通过 `--status` / `--stop` 查看与停止后台实例
-**补充**: `--log-mode file|none` 控制后台日志是否写入 `.dev/dev-runner.log`；Windows 后台模式会同时为守护进程子进程启用隐藏窗口，并将 stdout/stderr 显式重定向到日志文件或空设备，降低额外控制台窗口弹出的概率
+**补充**: `--log-mode file|none` 控制后台日志是否写入 `.dev/dev-runner.log`；Windows 后台模式会同时为守护进程子进程启用隐藏窗口，并将 stdout/stderr 显式重定向到日志文件或空设备，降低额外控制台窗口弹出的概率；若状态文件缺失，`--status` / `autostart status` 会回退到实际守护进程探测，避免误报“未运行”
 
 ### 基础校验命令
 **条件**: 执行 `bun run typecheck` 或 `bun run test`
@@ -39,7 +39,7 @@
 **条件**: 在启用 `systemd --user` 的 Linux 环境执行 `bun run autostart -- enable ...`
 **行为**: `scripts/autostart.mjs` 生成 `~/.config/systemd/user/api-worker-dev-autostart.service`，并通过 `systemctl --user daemon-reload` + `enable --now` 注册登录后自动启动
 **结果**: Linux 开发环境可复用同一条 `bun run autostart` 命令配置用户级自启动
-**补充**: `status` / `disable` 分别通过 `systemctl --user show` 与 `disable --now` 查询和移除同名 service；实际启动命令仍为 `bun run dev -- --bg`
+**补充**: Linux service 会直接托管 `scripts/dev.mjs` 的守护进程分支，不再通过 `--bg` 二次派生后台实例；`status` / `disable` 分别通过 `systemctl --user show` 与 `disable --now` 查询和移除同名 service，`status` 还会结合 `.dev/dev-runner.json` 判断后台实例是否真的在运行，并在检测到旧版 `--bg` service 时提示重新执行 `enable` 覆盖更新
 
 ## 依赖关系
 

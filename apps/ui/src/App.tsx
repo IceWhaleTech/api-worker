@@ -28,15 +28,16 @@ import {
 } from "./core/constants";
 import {
 	filterSites,
+	getVerificationStageTone,
+	getVerificationVerdictLabel,
+	summarizeVerificationResults,
 	type SiteSortState,
-	type SiteTestResult,
-	type SiteTestSummary,
 	sortSites,
-	summarizeSiteTests,
 } from "./core/sites";
 import type {
 	AdminData,
 	BackupImportMode,
+	BackupManualAction,
 	BackupImportResult,
 	BackupSettings,
 	BackupSyncResult,
@@ -49,6 +50,8 @@ import type {
 	SettingsForm,
 	Site,
 	SiteForm,
+	SiteVerificationBatchReport,
+	SiteVerificationResult,
 	SiteType,
 	TabId,
 	Token,
@@ -118,16 +121,15 @@ type ConfirmState = {
 	onConfirm: () => Promise<void> | void;
 };
 
-type SiteTestFailureItem = {
-	id: string;
-	name: string;
-	message: string;
+type SiteVerificationReportState = {
+	title: string;
+	description: string;
+	report: SiteVerificationBatchReport;
 };
 
-type SiteTestAllReport = {
-	summary: SiteTestSummary;
-	failedSites: SiteTestFailureItem[];
-	runsAt: string;
+type SiteVerificationDialogState = {
+	title: string;
+	result: SiteVerificationResult;
 };
 
 type EditableBackupSettings = Pick<
@@ -146,6 +148,57 @@ type EditableBackupSettings = Pick<
 
 const buildActionKey = (scope: string, id?: string) =>
 	id ? `${scope}:${id}` : scope;
+
+const getVerificationStageClass = (tone: string) => {
+	if (tone === "success") {
+		return "border-emerald-200 bg-emerald-50/80 text-emerald-700";
+	}
+	if (tone === "warning") {
+		return "border-amber-200 bg-amber-50/80 text-amber-700";
+	}
+	if (tone === "danger") {
+		return "border-rose-200 bg-rose-50/80 text-rose-700";
+	}
+	return "border-white/60 bg-white/70 text-[color:var(--app-ink-muted)]";
+};
+
+const getSuggestedActionLabel = (action: string) => {
+	if (action === "fix_credentials") {
+		return "检查站点或调用令牌";
+	}
+	if (action === "fix_endpoint") {
+		return "检查站点地址与 endpoint 配置";
+	}
+	if (action === "fix_model_config") {
+		return "补充模型配置或模型映射";
+	}
+	if (action === "retry") {
+		return "稍后重试";
+	}
+	if (action === "manual_review") {
+		return "需要人工排查";
+	}
+	return "无需额外处理";
+};
+
+const getPrimaryVerificationIssue = (result: SiteVerificationResult) => {
+	if (result.stages.service.status === "fail") {
+		return result.stages.service.message;
+	}
+	if (result.stages.capability.status === "fail") {
+		return result.stages.capability.message;
+	}
+	if (result.stages.connectivity.status === "fail") {
+		return result.stages.connectivity.message;
+	}
+	if (result.stages.recovery.status === "fail") {
+		return result.stages.recovery.message;
+	}
+	if (result.stages.capability.status === "warn") {
+		return result.stages.capability.message;
+	}
+	return result.message;
+};
 
 const pickEditableBackupSettings = (
 	settings: BackupSettings,
@@ -179,8 +232,14 @@ const buildRecommendedSettingsForm = (
 	channel_disable_error_codes: [
 		...initialSettingsForm.channel_disable_error_codes,
 	],
+	channel_permanent_disable_error_codes: [
+		...initialSettingsForm.channel_permanent_disable_error_codes,
+	],
 	proxy_retry_sleep_error_codes: [
 		...initialSettingsForm.proxy_retry_sleep_error_codes,
+	],
+	proxy_retry_return_error_codes: [
+		...initialSettingsForm.proxy_retry_return_error_codes,
 	],
 	proxy_retry_max_retries: "3",
 	channel_recovery_probe_enabled: true,
@@ -381,9 +440,12 @@ const App = () => {
 		null,
 	);
 	const [checkinLastRun, setCheckinLastRun] = useState<string | null>(null);
-	const [siteTestAllReport, setSiteTestAllReport] =
-		useState<SiteTestAllReport | null>(null);
-	const [isSiteTestReportOpen, setSiteTestReportOpen] = useState(false);
+	const [siteVerificationReport, setSiteVerificationReport] =
+		useState<SiteVerificationReportState | null>(null);
+	const [isSiteVerificationReportOpen, setSiteVerificationReportOpen] =
+		useState(false);
+	const [siteVerificationDialog, setSiteVerificationDialog] =
+		useState<SiteVerificationDialogState | null>(null);
 	const [, setPendingActions] = useState<Set<string>>(() => new Set());
 	const pendingActionsRef = useRef<Set<string>>(new Set()) as {
 		current: Set<string>;
@@ -480,8 +542,12 @@ const App = () => {
 		}
 	}, [confirmPending]);
 
-	const closeSiteTestReport = useCallback(() => {
-		setSiteTestReportOpen(false);
+	const closeSiteVerificationReport = useCallback(() => {
+		setSiteVerificationReportOpen(false);
+	}, []);
+
+	const closeSiteVerificationDialog = useCallback(() => {
+		setSiteVerificationDialog(null);
 	}, []);
 
 	const handleConfirm = useCallback(async () => {
@@ -782,10 +848,15 @@ const App = () => {
 			),
 			channel_disable_error_codes:
 				runtimeSettings?.channel_disable_error_codes ?? [
-					"upstream_http_401",
-					"upstream_http_403",
 					"do_request_failed",
 					"proxy_upstream_fetch_exception",
+					"model_not_found",
+					"stream_options_unsupported",
+				],
+			channel_permanent_disable_error_codes:
+				runtimeSettings?.channel_permanent_disable_error_codes ?? [
+					"upstream_http_401",
+					"upstream_http_403",
 				],
 			channel_disable_error_threshold: String(
 				runtimeSettings?.channel_disable_error_threshold ?? 3,
@@ -802,6 +873,19 @@ const App = () => {
 				runtimeSettings?.retry_sleep_error_codes ?? [
 					"system_cpu_overloaded",
 					"system_disk_overloaded",
+				],
+			proxy_retry_return_error_codes:
+				runtimeSettings?.retry_return_error_codes ?? [
+					"no_available_channels",
+					"upstream_cooldown",
+					"responses_previous_response_id_required",
+					"responses_affinity_missing",
+					"responses_affinity_channel_disabled",
+					"responses_affinity_channel_not_allowed",
+					"responses_affinity_channel_model_unavailable",
+					"responses_affinity_channel_cooldown",
+					"responses_tool_call_chain_mismatch",
+					"invalid_function_parameters",
 				],
 			proxy_zero_completion_as_error_enabled:
 				runtimeSettings?.zero_completion_as_error_enabled ?? true,
@@ -1174,143 +1258,149 @@ const App = () => {
 		[dismissNotice],
 	);
 
-	const handleSiteTest = useCallback(
+	const openVerificationResult = useCallback(
+		(title: string, result: SiteVerificationResult) => {
+			setSiteVerificationDialog({ title, result });
+		},
+		[],
+	);
+
+	const openVerificationReport = useCallback(
+		(
+			title: string,
+			description: string,
+			report: SiteVerificationBatchReport,
+		) => {
+			setSiteVerificationReport({
+				title,
+				description,
+				report,
+			});
+			setSiteVerificationReportOpen(true);
+		},
+		[],
+	);
+
+	const handleSiteVerify = useCallback(
 		async (id: string) => {
-			const actionKey = buildActionKey("site:test", id);
+			const actionKey = buildActionKey("site:verify", id);
 			if (isActionPending(actionKey)) {
 				return;
 			}
 			startAction(actionKey);
 			try {
-				const result = await apiFetch<{
-					models: Array<{ id: string }>;
-					token_summary?: {
-						total: number;
-						success: number;
-						failed: number;
-					};
-				}>(`/api/channels/${id}/test`, {
-					method: "POST",
-				});
+				const result = await apiFetch<SiteVerificationResult>(
+					`/api/sites/${id}/verify`,
+					{
+						method: "POST",
+					},
+				);
 				await loadSites();
-				const modelCount = result.models?.length ?? 0;
-				const summary = result.token_summary;
-				const detail = summary
-					? `，令牌成功 ${summary.success}/${summary.total}${
-							summary.failed > 0 ? `，失败 ${summary.failed}` : ""
-						}`
-					: "";
-				pushNotice("success", `站点测试完成，模型数 ${modelCount}${detail}`);
+				openVerificationResult("站点验证结果", result);
+				pushNotice(
+					result.verdict === "serving" || result.verdict === "recoverable"
+						? "success"
+						: result.verdict === "degraded"
+							? "warning"
+							: "error",
+					result.message,
+				);
 			} catch (error) {
 				pushNotice("error", (error as Error).message);
 			} finally {
 				endAction(actionKey);
 			}
 		},
-		[endAction, isActionPending, loadSites, pushNotice, startAction, apiFetch],
+		[
+			apiFetch,
+			endAction,
+			isActionPending,
+			loadSites,
+			openVerificationResult,
+			pushNotice,
+			startAction,
+		],
 	);
 
-	const handleSiteTestAll = useCallback(async () => {
-		const actionKey = buildActionKey("site:testAll");
+	const handleSiteVerifyAll = useCallback(async () => {
+		const actionKey = buildActionKey("site:verifyAll");
 		if (isActionPending(actionKey)) {
 			return;
 		}
 		if (data.sites.length === 0) {
-			pushNotice("warning", "暂无站点可测试");
+			pushNotice("warning", "暂无站点可验证");
 			return;
 		}
 		startAction(actionKey);
-		setSiteTestAllReport(null);
-		setSiteTestReportOpen(false);
-		pushNotice("info", "正在批量测试站点...");
-		const results: SiteTestResult[] = [];
-		const failedSites: SiteTestFailureItem[] = [];
+		setSiteVerificationReport(null);
+		setSiteVerificationReportOpen(false);
+		pushNotice("info", "正在批量验证站点...");
 		try {
-			for (const site of data.sites) {
-				if (site.status !== "active") {
-					results.push({ status: "skipped" });
-					continue;
-				}
-				try {
-					await apiFetch(`/api/channels/${site.id}/test`, {
-						method: "POST",
-					});
-					results.push({ status: "success" });
-				} catch (error) {
-					results.push({ status: "failed" });
-					failedSites.push({
-						id: site.id,
-						name: site.name || site.id,
-						message: (error as Error).message || "测试失败",
-					});
-				}
-			}
+			const report = await apiFetch<SiteVerificationBatchReport>(
+				"/api/sites/verify-batch",
+				{
+					method: "POST",
+				},
+			);
 			await loadSites();
-			const summary = summarizeSiteTests(results);
-			const testedTotal = summary.success + summary.failed;
-			if (testedTotal === 0) {
-				pushNotice(
-					"info",
-					`已跳过 ${summary.skipped} 个禁用站点，暂无可测试站点。`,
-				);
-				return;
-			}
-			setSiteTestAllReport({
-				summary,
-				failedSites,
-				runsAt: new Date().toISOString(),
-			});
-			let message =
-				summary.failed > 0
-					? `批量测试完成，成功 ${summary.success}/${testedTotal}，失败 ${summary.failed}。`
-					: `批量测试完成，成功 ${summary.success}/${testedTotal}。`;
-			if (summary.skipped > 0) {
-				message += ` 已跳过 ${summary.skipped} 个禁用站点。`;
-			}
-			if (failedSites.length > 0) {
-				setSiteTestReportOpen(true);
-				message += " 已生成失败清单。";
-			}
-			pushNotice(summary.failed > 0 ? "warning" : "success", message);
+			openVerificationReport(
+				"批量验证报告",
+				`最近执行：${new Date(report.runs_at).toLocaleString("zh-CN", {
+					hour12: false,
+				})}`,
+				report,
+			);
+			const summary = report.summary;
+			pushNotice(
+				summary.failed > 0 || summary.not_recoverable > 0
+					? "warning"
+					: "success",
+				`批量验证完成：可服务 ${summary.serving}，部分异常 ${summary.degraded}，不可服务 ${summary.failed}。`,
+			);
+		} catch (error) {
+			pushNotice("error", (error as Error).message);
 		} finally {
 			endAction(actionKey);
 		}
 	}, [
 		apiFetch,
-		data.sites,
+		data.sites.length,
 		endAction,
 		isActionPending,
 		loadSites,
+		openVerificationReport,
 		pushNotice,
 		startAction,
 	]);
 
-	const handleSiteProbeRecovery = useCallback(async () => {
-		const actionKey = buildActionKey("site:probeRecovery");
+	const handleSiteRecoveryEvaluate = useCallback(async () => {
+		const actionKey = buildActionKey("site:recoveryEvaluate");
 		if (isActionPending(actionKey)) {
 			return;
 		}
 		startAction(actionKey);
 		try {
-			const result = await apiFetch<{
-				summary: {
-					total: number;
-					attempted: number;
-					recovered: number;
-					failed: number;
-				};
-			}>("/api/sites/probe-recovery", {
-				method: "POST",
-			});
+			const report = await apiFetch<SiteVerificationBatchReport>(
+				"/api/sites/recovery-evaluate",
+				{
+					method: "POST",
+				},
+			);
 			await loadSites();
-			const summary = result.summary;
-			if (summary.total === 0) {
-				pushNotice("info", "当前没有禁用站点可探测");
+			if (report.summary.total === 0) {
+				pushNotice("info", "当前没有已禁用站点需要评估恢复");
 				return;
 			}
+			openVerificationReport(
+				"恢复评估报告",
+				`最近执行：${new Date(report.runs_at).toLocaleString("zh-CN", {
+					hour12: false,
+				})}`,
+				report,
+			);
 			pushNotice(
-				summary.recovered > 0 ? "success" : "warning",
-				`探测完成：恢复 ${summary.recovered}/${summary.total}，失败 ${summary.failed}。`,
+				report.summary.recoverable > 0 ? "success" : "warning",
+				`恢复评估完成：可恢复 ${report.summary.recoverable}，暂不可恢复 ${report.summary.not_recoverable}。`,
 			);
 		} catch (error) {
 			pushNotice("error", (error as Error).message);
@@ -1322,6 +1412,7 @@ const App = () => {
 		endAction,
 		isActionPending,
 		loadSites,
+		openVerificationReport,
 		pushNotice,
 		startAction,
 	]);
@@ -1400,8 +1491,8 @@ const App = () => {
 				closeSiteModal();
 				await loadSites();
 				if (siteId) {
-					pushNotice("info", `站点已${actionLabel}，正在自动测试...`);
-					await handleSiteTest(siteId);
+					pushNotice("info", `站点已${actionLabel}，正在自动验证...`);
+					await handleSiteVerify(siteId);
 				} else {
 					pushNotice("success", `站点已${actionLabel}`);
 				}
@@ -1419,7 +1510,7 @@ const App = () => {
 			endAction,
 			isActionPending,
 			loadSites,
-			handleSiteTest,
+			handleSiteVerify,
 			pushNotice,
 			siteForm,
 			startAction,
@@ -1555,6 +1646,12 @@ const App = () => {
 			);
 			const retrySleepErrorCodes = normalizeErrorCodeList(
 				settingsForm.proxy_retry_sleep_error_codes,
+			);
+			const retryReturnErrorCodes = normalizeErrorCodeList(
+				settingsForm.proxy_retry_return_error_codes,
+			);
+			const channelPermanentDisableErrorCodes = normalizeErrorCodeList(
+				settingsForm.channel_permanent_disable_error_codes,
 			);
 			const streamUsageMode = settingsForm.proxy_stream_usage_mode
 				.trim()
@@ -1720,6 +1817,14 @@ const App = () => {
 				pushNotice("warning", "备份历史保留数量需为正整数");
 				return;
 			}
+			const settingsChanged =
+				JSON.stringify(settingsForm) !== JSON.stringify(settingsFormSnapshot);
+			const backupChanged =
+				JSON.stringify(pickEditableBackupSettings(backupSettings)) !==
+				JSON.stringify(backupSettingsSnapshot);
+			if (!settingsChanged && !backupChanged) {
+				return;
+			}
 			startAction(actionKey);
 			const payload: Record<string, unknown> = {
 				log_retention_days: retention,
@@ -1738,6 +1843,9 @@ const App = () => {
 				proxy_retry_max_retries: retryMaxRetries,
 				proxy_retry_sleep_ms: retrySleepMs,
 				proxy_retry_sleep_error_codes: retrySleepErrorCodes,
+				proxy_retry_return_error_codes: retryReturnErrorCodes,
+				channel_permanent_disable_error_codes:
+					channelPermanentDisableErrorCodes,
 				proxy_zero_completion_as_error_enabled:
 					settingsForm.proxy_zero_completion_as_error_enabled,
 				proxy_stream_usage_mode: streamUsageMode,
@@ -1760,12 +1868,8 @@ const App = () => {
 				payload.admin_password = password;
 			}
 			try {
-				await Promise.all([
-					apiFetch("/api/settings", {
-						method: "PUT",
-						body: JSON.stringify(payload),
-					}),
-					apiFetch("/api/backup/sync-config", {
+				if (backupChanged) {
+					await apiFetch("/api/backup/sync-config", {
 						method: "PUT",
 						body: JSON.stringify({
 							enabled: backupSettings.enabled,
@@ -1779,8 +1883,14 @@ const App = () => {
 							webdav_path: backupSettings.webdav_path.trim(),
 							keep_versions: backupKeepVersions,
 						}),
-					}),
-				]);
+					});
+				}
+				if (settingsChanged) {
+					await apiFetch("/api/settings", {
+						method: "PUT",
+						body: JSON.stringify(payload),
+					});
+				}
 				await Promise.all([
 					loadSettings(),
 					loadRetryErrorCodes(),
@@ -1804,7 +1914,9 @@ const App = () => {
 			loadSettings,
 			pushNotice,
 			settingsForm,
+			settingsFormSnapshot,
 			startAction,
+			backupSettingsSnapshot,
 		],
 	);
 
@@ -1893,48 +2005,62 @@ const App = () => {
 		startAction,
 	]);
 
-	const handleBackupSyncNow = useCallback(async () => {
-		const actionKey = buildActionKey("backup:sync");
-		if (isActionPending(actionKey)) {
-			return;
-		}
-		startAction(actionKey);
-		try {
-			const result = await apiFetch<BackupSyncResult>("/api/backup/sync-now", {
-				method: "POST",
-				body: JSON.stringify({ mode: backupSettings.sync_mode }),
-			});
-			await loadBackupSettings();
-			if (result.action === "pull") {
-				await Promise.all([
-					loadSites(),
-					loadTokens(),
-					loadSettings(),
-					loadRetryErrorCodes(),
-				]);
+	const handleBackupSyncNow = useCallback(
+		async (action: BackupManualAction) => {
+			const actionKey = buildActionKey(`backup:${action}`);
+			if (
+				isActionPending(actionKey) ||
+				isActionPending(buildActionKey("backup:push")) ||
+				isActionPending(buildActionKey("backup:pull"))
+			) {
+				return;
 			}
-			pushNotice(
-				"success",
-				`同步完成：模式 ${result.mode}，动作 ${result.action}`,
-			);
-		} catch (error) {
-			pushNotice("error", (error as Error).message);
-		} finally {
-			endAction(actionKey);
-		}
-	}, [
-		apiFetch,
-		backupSettings.sync_mode,
-		endAction,
-		isActionPending,
-		loadBackupSettings,
-		loadRetryErrorCodes,
-		loadSettings,
-		loadSites,
-		loadTokens,
-		pushNotice,
-		startAction,
-	]);
+			startAction(actionKey);
+			try {
+				const result = await apiFetch<BackupSyncResult>(
+					"/api/backup/sync-now",
+					{
+						method: "POST",
+						body: JSON.stringify({ action }),
+					},
+				);
+				await loadBackupSettings();
+				if (result.action === "pull") {
+					await Promise.all([
+						loadSites(),
+						loadTokens(),
+						loadSettings(),
+						loadRetryErrorCodes(),
+					]);
+				}
+				pushNotice("success", action === "push" ? "上传完成" : "下载完成");
+			} catch (error) {
+				pushNotice("error", (error as Error).message);
+			} finally {
+				endAction(actionKey);
+			}
+		},
+		[
+			apiFetch,
+			endAction,
+			isActionPending,
+			loadBackupSettings,
+			loadRetryErrorCodes,
+			loadSettings,
+			loadSites,
+			loadTokens,
+			pushNotice,
+			startAction,
+		],
+	);
+
+	const handleBackupPushNow = useCallback(async () => {
+		await handleBackupSyncNow("push");
+	}, [handleBackupSyncNow]);
+
+	const handleBackupPullNow = useCallback(async () => {
+		await handleBackupSyncNow("pull");
+	}, [handleBackupSyncNow]);
 
 	const handleSiteDelete = useCallback(
 		async (id: string) => {
@@ -2006,40 +2132,49 @@ const App = () => {
 	);
 
 	const handleDisableFailedSite = useCallback(
-		async (site: SiteTestFailureItem) => {
-			const actionKey = buildActionKey("site:disableFailed", site.id);
+		async (site: SiteVerificationResult) => {
+			const actionKey = buildActionKey("site:disableFailed", site.site_id);
 			if (isActionPending(actionKey)) {
 				return;
 			}
 			startAction(actionKey);
 			try {
-				await apiFetch(`/api/sites/${site.id}`, {
+				await apiFetch(`/api/sites/${site.site_id}`, {
 					method: "PATCH",
 					body: JSON.stringify({ status: "disabled" }),
 				});
 				await loadSites();
-				setSiteTestAllReport((prev) => {
+				setSiteVerificationReport((prev) => {
 					if (!prev) {
 						return prev;
 					}
+					const nextItems = prev.report.items.filter(
+						(item) => item.site_id !== site.site_id,
+					);
 					return {
 						...prev,
-						failedSites: prev.failedSites.filter((item) => item.id !== site.id),
+						report: {
+							...prev.report,
+							items: nextItems,
+							summary: summarizeVerificationResults(nextItems),
+						},
 					};
 				});
-				pushNotice("success", `已禁用失败站点：${site.name}`);
+				pushNotice("success", `已禁用站点：${site.site_name}`);
 			} catch (error) {
 				pushNotice("error", (error as Error).message);
 			} finally {
 				endAction(actionKey);
 			}
 		},
-		[endAction, isActionPending, loadSites, pushNotice, startAction, apiFetch],
+		[apiFetch, endAction, isActionPending, loadSites, pushNotice, startAction],
 	);
 
 	const handleDisableAllFailedSites = useCallback(async () => {
-		const report = siteTestAllReport;
-		if (!report || report.failedSites.length === 0) {
+		const report = siteVerificationReport;
+		const failedItems =
+			report?.report.items.filter((item) => item.verdict === "failed") ?? [];
+		if (!report || failedItems.length === 0) {
 			pushNotice("info", "当前没有可禁用的失败站点");
 			return;
 		}
@@ -2050,12 +2185,12 @@ const App = () => {
 		startAction(actionKey);
 		try {
 			const settled = await Promise.allSettled(
-				report.failedSites.map(async (item) => {
-					await apiFetch(`/api/sites/${item.id}`, {
+				failedItems.map(async (item) => {
+					await apiFetch(`/api/sites/${item.site_id}`, {
 						method: "PATCH",
 						body: JSON.stringify({ status: "disabled" }),
 					});
-					return item.id;
+					return item.site_id;
 				}),
 			);
 			const successIds = settled
@@ -2066,16 +2201,21 @@ const App = () => {
 				.map((item) => item.value);
 			const failedCount = settled.length - successIds.length;
 			await loadSites();
-			setSiteTestAllReport((prev) => {
+			setSiteVerificationReport((prev) => {
 				if (!prev || successIds.length === 0) {
 					return prev;
 				}
 				const successSet = new Set(successIds);
+				const nextItems = prev.report.items.filter(
+					(item) => !successSet.has(item.site_id),
+				);
 				return {
 					...prev,
-					failedSites: prev.failedSites.filter(
-						(item) => !successSet.has(item.id),
-					),
+					report: {
+						...prev.report,
+						items: nextItems,
+						summary: summarizeVerificationResults(nextItems),
+					},
 				};
 			});
 			if (failedCount > 0) {
@@ -2097,32 +2237,38 @@ const App = () => {
 		isActionPending,
 		loadSites,
 		pushNotice,
-		siteTestAllReport,
+		siteVerificationReport,
+		summarizeVerificationResults,
 		startAction,
 	]);
 
 	const requestDisableAllFailedSites = useCallback(() => {
-		const report = siteTestAllReport;
-		if (!report || report.failedSites.length === 0) {
+		const report = siteVerificationReport;
+		const failedItems =
+			report?.report.items.filter((item) => item.verdict === "failed") ?? [];
+		if (!report || failedItems.length === 0) {
 			pushNotice("info", "当前没有可禁用的失败站点");
 			return;
 		}
-		const names = report.failedSites
+		const names = failedItems
 			.slice(0, 5)
-			.map((item) => item.name)
+			.map((item) => item.site_name)
 			.join("、");
 		const suffix =
-			report.failedSites.length > 5
-				? ` 等 ${report.failedSites.length} 个站点`
-				: "";
+			failedItems.length > 5 ? ` 等 ${failedItems.length} 个站点` : "";
 		openConfirm({
 			title: "批量禁用失败站点",
-			message: `将禁用以下测试失败站点：${names}${suffix}。确认继续吗？`,
+			message: `将禁用以下验证失败站点：${names}${suffix}。确认继续吗？`,
 			confirmLabel: "禁用全部失败站点",
 			tone: "error",
 			onConfirm: () => handleDisableAllFailedSites(),
 		});
-	}, [handleDisableAllFailedSites, openConfirm, pushNotice, siteTestAllReport]);
+	}, [
+		handleDisableAllFailedSites,
+		openConfirm,
+		pushNotice,
+		siteVerificationReport,
+	]);
 
 	const handleTokenDelete = useCallback(
 		async (id: string) => {
@@ -2427,7 +2573,7 @@ const App = () => {
 					onCloseModal={closeSiteModal}
 					onEdit={startSiteEdit}
 					onSubmit={handleSiteSubmit}
-					onTest={handleSiteTest}
+					onVerify={handleSiteVerify}
 					onCheckin={handleCheckinRunSite}
 					onToggle={handleSiteToggle}
 					onDelete={requestSiteDelete}
@@ -2437,10 +2583,14 @@ const App = () => {
 					onSortChange={handleSiteSortChange}
 					onFormChange={handleSiteFormChange}
 					onRunAll={handleCheckinRunAll}
-					onTestAll={handleSiteTestAll}
-					onProbeRecovery={handleSiteProbeRecovery}
-					testFailureCount={siteTestAllReport?.failedSites.length ?? 0}
-					onOpenTestFailures={() => setSiteTestReportOpen(true)}
+					onVerifyAll={handleSiteVerifyAll}
+					onEvaluateRecovery={handleSiteRecoveryEvaluate}
+					failureCount={
+						siteVerificationReport?.report.items.filter(
+							(item) => item.verdict === "failed",
+						).length ?? 0
+					}
+					onOpenVerificationReport={() => setSiteVerificationReportOpen(true)}
 				/>
 			);
 		}
@@ -2511,7 +2661,8 @@ const App = () => {
 					backupImportFileName={backupImportFile?.name ?? ""}
 					isBackupExporting={isActionPending(buildActionKey("backup:export"))}
 					isBackupImporting={isActionPending(buildActionKey("backup:import"))}
-					isBackupSyncing={isActionPending(buildActionKey("backup:sync"))}
+					isBackupPushing={isActionPending(buildActionKey("backup:push"))}
+					isBackupPulling={isActionPending(buildActionKey("backup:pull"))}
 					onSubmit={handleSettingsSubmit}
 					onFormChange={handleSettingsFormChange}
 					onBackupSettingsChange={handleBackupSettingsChange}
@@ -2519,7 +2670,8 @@ const App = () => {
 					onBackupImportModeChange={handleBackupImportModeChange}
 					onBackupImportFileChange={handleBackupImportFileChange}
 					onBackupImport={handleBackupImport}
-					onBackupSyncNow={handleBackupSyncNow}
+					onBackupPushNow={handleBackupPushNow}
+					onBackupPullNow={handleBackupPullNow}
 					onApplyRecommendedConfig={handleApplyRecommendedConfig}
 				/>
 			);
@@ -2550,66 +2702,193 @@ const App = () => {
 					onSubmit={handleLogin}
 				/>
 			)}
-			{siteTestAllReport && (
-				<Dialog open={isSiteTestReportOpen} onClose={closeSiteTestReport}>
+			{siteVerificationDialog && (
+				<Dialog
+					open={Boolean(siteVerificationDialog)}
+					onClose={closeSiteVerificationDialog}
+				>
 					<DialogContent
-						aria-labelledby="site-test-report-title"
+						aria-labelledby="site-verification-title"
 						aria-modal="true"
 						class="max-w-4xl"
 					>
 						<DialogHeader>
 							<div>
-								<DialogTitle id="site-test-report-title">
-									一键测试失败清单
+								<DialogTitle id="site-verification-title">
+									{siteVerificationDialog.title}
 								</DialogTitle>
 								<DialogDescription>
-									最近测试：
-									{new Date(siteTestAllReport.runsAt).toLocaleString("zh-CN", {
-										hour12: false,
-									})}
-									。成功 {siteTestAllReport.summary.success} / 失败{" "}
-									{siteTestAllReport.summary.failed} / 跳过{" "}
-									{siteTestAllReport.summary.skipped}
+									{siteVerificationDialog.result.site_name} ·{" "}
+									{getVerificationVerdictLabel(
+										siteVerificationDialog.result.verdict,
+									)}
+									。{siteVerificationDialog.result.message}
 								</DialogDescription>
 							</div>
-							<Button size="sm" type="button" onClick={closeSiteTestReport}>
+							<Button
+								size="sm"
+								type="button"
+								onClick={closeSiteVerificationDialog}
+							>
+								关闭
+							</Button>
+						</DialogHeader>
+						<div class="mt-3 grid gap-3 md:grid-cols-2">
+							{(
+								[
+									[
+										"连接验证",
+										siteVerificationDialog.result.stages.connectivity,
+									],
+									["能力验证", siteVerificationDialog.result.stages.capability],
+									["服务验证", siteVerificationDialog.result.stages.service],
+									["恢复评估", siteVerificationDialog.result.stages.recovery],
+								] as const
+							).map(([label, stage]) => {
+								const tone = getVerificationStageTone(stage.status);
+								return (
+									<div
+										class={`rounded-2xl border px-4 py-4 ${getVerificationStageClass(
+											tone,
+										)}`}
+										key={label}
+									>
+										<div class="flex items-center justify-between gap-3">
+											<p class="text-sm font-semibold">{label}</p>
+											<span class="text-xs font-semibold uppercase tracking-widest">
+												{stage.status}
+											</span>
+										</div>
+										<p class="mt-2 text-xs">{stage.message}</p>
+										<p class="mt-2 text-[11px] opacity-80">
+											code: {stage.code}
+										</p>
+									</div>
+								);
+							})}
+						</div>
+						<div class="mt-4 grid gap-3 rounded-2xl border border-white/60 bg-white/75 px-4 py-4 md:grid-cols-2">
+							<div>
+								<p class="text-xs uppercase tracking-widest text-[color:var(--app-ink-muted)]">
+									验证模型
+								</p>
+								<p class="mt-1 text-sm font-semibold text-[color:var(--app-ink)]">
+									{siteVerificationDialog.result.selected_model ?? "未选择"}
+								</p>
+							</div>
+							<div>
+								<p class="text-xs uppercase tracking-widest text-[color:var(--app-ink-muted)]">
+									建议动作
+								</p>
+								<p class="mt-1 text-sm font-semibold text-[color:var(--app-ink)]">
+									{getSuggestedActionLabel(
+										siteVerificationDialog.result.suggested_action,
+									)}
+								</p>
+							</div>
+							<div>
+								<p class="text-xs uppercase tracking-widest text-[color:var(--app-ink-muted)]">
+									调用令牌
+								</p>
+								<p class="mt-1 text-sm font-semibold text-[color:var(--app-ink)]">
+									{siteVerificationDialog.result.selected_token?.name ??
+										"未命中"}
+								</p>
+							</div>
+							<div>
+								<p class="text-xs uppercase tracking-widest text-[color:var(--app-ink-muted)]">
+									上游状态
+								</p>
+								<p class="mt-1 text-sm font-semibold text-[color:var(--app-ink)]">
+									{siteVerificationDialog.result.trace.upstream_status ?? "-"}
+								</p>
+							</div>
+						</div>
+						<DialogFooter>
+							<Button
+								size="sm"
+								type="button"
+								onClick={closeSiteVerificationDialog}
+							>
+								关闭
+							</Button>
+						</DialogFooter>
+					</DialogContent>
+				</Dialog>
+			)}
+			{siteVerificationReport && (
+				<Dialog
+					open={isSiteVerificationReportOpen}
+					onClose={closeSiteVerificationReport}
+				>
+					<DialogContent
+						aria-labelledby="site-verification-report-title"
+						aria-modal="true"
+						class="max-w-4xl"
+					>
+						<DialogHeader>
+							<div>
+								<DialogTitle id="site-verification-report-title">
+									{siteVerificationReport.title}
+								</DialogTitle>
+								<DialogDescription>
+									{siteVerificationReport.description}
+									。可服务 {siteVerificationReport.report.summary.serving} /
+									部分异常 {siteVerificationReport.report.summary.degraded} /
+									不可服务 {siteVerificationReport.report.summary.failed} /
+									可恢复 {siteVerificationReport.report.summary.recoverable}
+								</DialogDescription>
+							</div>
+							<Button
+								size="sm"
+								type="button"
+								onClick={closeSiteVerificationReport}
+							>
 								关闭
 							</Button>
 						</DialogHeader>
 						<div class="mt-3 max-h-[55vh] space-y-3 overflow-y-auto">
-							{siteTestAllReport.failedSites.length === 0 ? (
+							{siteVerificationReport.report.items.length === 0 ? (
 								<div class="rounded-xl border border-white/60 bg-white/70 px-4 py-4 text-sm text-[color:var(--app-ink-muted)]">
-									失败站点已处理完毕。
+									当前没有可展示的验证结果。
 								</div>
 							) : (
 								<div class="space-y-2">
-									{siteTestAllReport.failedSites.map((item) => (
+									{siteVerificationReport.report.items.map((item) => (
 										<div
 											class="grid gap-3 rounded-xl border border-white/60 bg-white/80 px-4 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1.8fr)_auto]"
-											key={item.id}
+											key={item.site_id}
 										>
 											<div class="min-w-0">
 												<p class="truncate text-sm font-semibold text-[color:var(--app-ink)]">
-													{item.name}
+													{item.site_name}
 												</p>
 												<p class="truncate text-[11px] text-[color:var(--app-ink-muted)]">
-													ID: {item.id}
+													ID: {item.site_id}
+												</p>
+												<p class="truncate text-[11px] text-[color:var(--app-ink-muted)]">
+													结论：{getVerificationVerdictLabel(item.verdict)}
 												</p>
 											</div>
-											<p class="text-xs text-[color:var(--app-danger)]">
-												{item.message}
-											</p>
+											<div class="space-y-1">
+												<p class="text-xs text-[color:var(--app-ink)]">
+													{getPrimaryVerificationIssue(item)}
+												</p>
+												<p class="text-[11px] text-[color:var(--app-ink-muted)]">
+													建议：{getSuggestedActionLabel(item.suggested_action)}
+												</p>
+											</div>
 											<div class="flex flex-wrap items-center justify-end gap-2">
 												<Button
 													size="sm"
 													type="button"
 													class="h-8 px-3 text-xs"
 													disabled={isActionPending(
-														buildActionKey("site:test", item.id),
+														buildActionKey("site:verify", item.site_id),
 													)}
-													onClick={() => handleSiteTest(item.id)}
+													onClick={() => handleSiteVerify(item.site_id)}
 												>
-													重测
+													重新验证
 												</Button>
 												<Button
 													size="sm"
@@ -2617,7 +2896,7 @@ const App = () => {
 													variant="danger"
 													class="h-8 px-3 text-xs"
 													disabled={isActionPending(
-														buildActionKey("site:disableFailed", item.id),
+														buildActionKey("site:disableFailed", item.site_id),
 													)}
 													onClick={() => handleDisableFailedSite(item)}
 												>
@@ -2630,7 +2909,11 @@ const App = () => {
 							)}
 						</div>
 						<DialogFooter>
-							<Button size="sm" type="button" onClick={closeSiteTestReport}>
+							<Button
+								size="sm"
+								type="button"
+								onClick={closeSiteVerificationReport}
+							>
 								关闭
 							</Button>
 							<Button
@@ -2638,7 +2921,9 @@ const App = () => {
 								type="button"
 								variant="danger"
 								disabled={
-									siteTestAllReport.failedSites.length === 0 ||
+									siteVerificationReport.report.items.filter(
+										(item) => item.verdict === "failed",
+									).length === 0 ||
 									isActionPending(buildActionKey("site:disableFailedAll"))
 								}
 								onClick={requestDisableAllFailedSites}

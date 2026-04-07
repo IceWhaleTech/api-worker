@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
 	closeSync,
 	existsSync,
@@ -13,6 +13,8 @@ import {
 import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
+
+import { buildBackgroundStateFromArgs } from "./autostart-shared.mjs";
 
 const BUN_CMD = (() => {
 	if (process.env.BUN_BIN && existsSync(process.env.BUN_BIN)) {
@@ -134,10 +136,7 @@ const parsePortFromEnv = (name, fallback) => {
 	return value;
 };
 
-const workerPort = parsePortFromEnv(
-	"DEV_WORKER_PORT",
-	parsePortFromEnv("DEV_PORT", 8787),
-);
+const workerPort = parsePortFromEnv("DEV_WORKER_PORT", 8787);
 const attemptWorkerPort = parsePortFromEnv("DEV_ATTEMPT_WORKER_PORT", 8788);
 const uiPort = parsePortFromEnv("DEV_UI_PORT", 4173);
 const workerInspectorPort = parsePortFromEnv("DEV_WORKER_INSPECTOR_PORT", 9229);
@@ -311,11 +310,17 @@ const readState = () => {
 	}
 };
 
-const removeState = () => {
+const removeState = (expectedPid) => {
 	if (!existsSync(statePath)) {
 		return;
 	}
 	try {
+		if (typeof expectedPid === "number") {
+			const state = readState();
+			if (!state || state.pid !== expectedPid) {
+				return;
+			}
+		}
 		unlinkSync(statePath);
 	} catch {
 		// ignore stale state cleanup errors
@@ -334,16 +339,61 @@ const isPidRunning = (pid) => {
 	}
 };
 
+const readDetachedBackgroundState = () => {
+	if (process.platform === "win32") {
+		return null;
+	}
+	const psResult = spawnSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
+	if (psResult.status !== 0) {
+		return null;
+	}
+	for (const line of psResult.stdout.split(/\r?\n/u)) {
+		const match = line.trim().match(/^(\d+)\s+(.+)$/u);
+		if (!match) {
+			continue;
+		}
+		const pid = Number(match[1]);
+		if (pid === process.pid) {
+			continue;
+		}
+		const commandLine = match[2];
+		if (
+			!commandLine.includes(scriptPath) ||
+			!commandLine.includes("--_daemon")
+		) {
+			continue;
+		}
+		const parts = commandLine.split(/\s+/u);
+		const scriptIndex = parts.findIndex((item) => item === scriptPath);
+		if (scriptIndex < 0) {
+			continue;
+		}
+		const startedAtResult = spawnSync(
+			"ps",
+			["-p", String(pid), "-o", "lstart="],
+			{
+				encoding: "utf8",
+			},
+		);
+		return buildBackgroundStateFromArgs({
+			pid,
+			args: parts.slice(scriptIndex + 1),
+			startedAt: startedAtResult.stdout.trim() || null,
+			defaultLogPath: logPath,
+		});
+	}
+	return null;
+};
+
 const readLiveState = () => {
 	const state = readState();
-	if (!state) {
-		return null;
+	if (state) {
+		if (isPidRunning(state.pid)) {
+			return state;
+		}
+		removeState(state.pid);
 	}
-	if (!isPidRunning(state.pid)) {
-		removeState();
-		return null;
-	}
-	return state;
+	return readDetachedBackgroundState();
 };
 
 const writeState = (state) => {
@@ -391,7 +441,7 @@ const shutdown = (code = 0) => {
 		}
 	}
 	if (daemonMode) {
-		removeState();
+		removeState(process.pid);
 	}
 	process.exit(code);
 };
@@ -808,7 +858,7 @@ process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 process.on("exit", () => {
 	if (daemonMode) {
-		removeState();
+		removeState(process.pid);
 	}
 });
 
@@ -851,13 +901,14 @@ const main = async () => {
 	}
 
 	if (daemonMode) {
-		writeState({
-			pid: process.pid,
-			args: runtimeArgs.filter((arg) => arg !== "--_daemon"),
-			startedAt: new Date().toISOString(),
-			logMode,
-			logPath: logMode === "file" ? logPath : null,
-		});
+		writeState(
+			buildBackgroundStateFromArgs({
+				pid: process.pid,
+				args: runtimeArgs,
+				startedAt: new Date().toISOString(),
+				defaultLogPath: logPath,
+			}),
+		);
 	}
 
 	await prepareUiBuild();

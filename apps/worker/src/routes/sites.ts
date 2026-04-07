@@ -21,11 +21,18 @@ import {
 	recoverDisabledChannelsViaWorker,
 	runCheckinAllViaWorker,
 	runCheckinSingleViaWorker,
+	verifyChannelById,
+	verifySitesByIds,
 } from "../services/site-task-dispatcher";
+import { triggerBackupAfterDataChange } from "../services/backup-auto-sync";
 import { generateToken } from "../utils/crypto";
 import { jsonError } from "../utils/http";
 import { nowIso } from "../utils/time";
 import { normalizeBaseUrl } from "../utils/url";
+import {
+	buildVerificationBatchResult,
+	parseSiteVerificationSummary,
+} from "../services/site-verification";
 
 const sites = new Hono<AppEnv>();
 
@@ -196,6 +203,7 @@ const buildSiteRecord = (
 		last_checkin_status: channel.last_checkin_status ?? null,
 		last_checkin_message: channel.last_checkin_message ?? null,
 		last_checkin_at: channel.last_checkin_at ?? null,
+		verification: parseSiteVerificationSummary(channel.metadata_json),
 		created_at: channel.created_at ?? null,
 		updated_at: channel.updated_at ?? null,
 	};
@@ -317,6 +325,7 @@ sites.post("/", async (c) => {
 		id,
 		toCallTokenRows(id, callTokens, now),
 	);
+	await triggerBackupAfterDataChange(c.env.DB);
 
 	await invalidateSelectionHotCache(c.env.KV_HOT);
 	return c.json({ id });
@@ -419,6 +428,7 @@ sites.patch("/:id", async (c) => {
 			toCallTokenRows(id, callTokens, nowIso()),
 		);
 	}
+	await triggerBackupAfterDataChange(c.env.DB);
 
 	await invalidateSelectionHotCache(c.env.KV_HOT);
 	return c.json({ ok: true });
@@ -427,6 +437,7 @@ sites.patch("/:id", async (c) => {
 sites.delete("/:id", async (c) => {
 	const id = c.req.param("id");
 	await deleteChannel(c.env.DB, id);
+	await triggerBackupAfterDataChange(c.env.DB);
 	await invalidateSelectionHotCache(c.env.KV_HOT);
 	return c.json({ ok: true });
 });
@@ -438,6 +449,30 @@ sites.post("/checkin-all", async (c) => {
 		summary: result.summary,
 		runs_at: result.runsAt,
 	});
+});
+
+sites.post("/:id/verify", async (c) => {
+	const id = c.req.param("id");
+	const result = await verifyChannelById(c.env.DB, id);
+	if (!result) {
+		return jsonError(c, 404, "site_not_found", "site_not_found");
+	}
+	await invalidateSelectionHotCache(c.env.KV_HOT);
+	return c.json(result);
+});
+
+sites.post("/verify-batch", async (c) => {
+	const body = await c.req.json().catch(() => null);
+	const ids = Array.isArray(body?.ids)
+		? body.ids
+				.map((item: unknown) => String(item ?? "").trim())
+				.filter((item: string) => item.length > 0)
+		: undefined;
+	const result = await verifySitesByIds(c.env.DB, ids);
+	if (result.items.length > 0) {
+		await invalidateSelectionHotCache(c.env.KV_HOT);
+	}
+	return c.json(result);
 });
 
 sites.post("/probe-recovery", async (c) => {
@@ -458,9 +493,31 @@ sites.post("/probe-recovery", async (c) => {
 	});
 });
 
+sites.post("/recovery-evaluate", async (c) => {
+	const result = await recoverDisabledChannelsViaWorker(c.env.DB, c.env);
+	if (result.recovered > 0) {
+		await invalidateSelectionHotCache(c.env.KV_HOT);
+	}
+	const verificationItems = result.items
+		.map((item) => item.verification)
+		.filter(
+			(
+				item,
+			): item is NonNullable<(typeof result.items)[number]["verification"]> =>
+				Boolean(item),
+		);
+	const report = await buildVerificationBatchResult(verificationItems);
+	return c.json(report);
+});
+
 sites.post("/:id/checkin", async (c) => {
 	const id = c.req.param("id");
-	const result = await runCheckinSingleViaWorker(c.env.DB, c.env, id, new Date());
+	const result = await runCheckinSingleViaWorker(
+		c.env.DB,
+		c.env,
+		id,
+		new Date(),
+	);
 	if (!result) {
 		return jsonError(c, 404, "site_not_found", "site_not_found");
 	}

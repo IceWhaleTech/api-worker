@@ -4,6 +4,7 @@ import {
 	normalizeProxyStreamUsageMode,
 	repairOpenAiToolCallChain,
 	resolveStreamMetaPartialReason,
+	sanitizeUpstreamRequestHeaders,
 	shouldMarkStreamMetaPartial,
 	shouldParseSuccessStreamUsage,
 	validateOpenAiToolCallChain,
@@ -14,6 +15,10 @@ import {
 	parseUsageFromSse,
 	type StreamUsageOptions,
 } from "../../../worker/src/utils/usage";
+import {
+	buildProxyErrorCodeSet,
+	resolveProxyErrorAction,
+} from "../../../worker/src/services/proxy-error-policy";
 import type { AppEnv } from "../env";
 
 const ATTEMPT_RESPONSE_PATH_HEADER = "x-ha-attempt-response-path";
@@ -26,10 +31,14 @@ const ATTEMPT_STREAM_FIRST_TOKEN_LATENCY_HEADER =
 	"x-ha-attempt-stream-first-token-latency-ms";
 const ATTEMPT_STREAM_META_PARTIAL_HEADER = "x-ha-attempt-stream-meta-partial";
 const ATTEMPT_STREAM_META_REASON_HEADER = "x-ha-attempt-stream-meta-reason";
+const ATTEMPT_STREAM_EVENTS_SEEN_HEADER = "x-ha-attempt-stream-events-seen";
+const ATTEMPT_STREAM_ERROR_CODE_HEADER = "x-ha-attempt-stream-error-code";
+const ATTEMPT_STREAM_ERROR_MESSAGE_HEADER = "x-ha-attempt-stream-error-message";
 const ATTEMPT_RESPONSE_ID_HEADER = "x-ha-attempt-response-id";
 const DISPATCH_ATTEMPT_INDEX_HEADER = "x-ha-dispatch-attempt-index";
 const DISPATCH_CHANNEL_ID_HEADER = "x-ha-dispatch-channel-id";
 const DISPATCH_STOP_RETRY_HEADER = "x-ha-dispatch-stop-retry";
+const DISPATCH_ERROR_ACTION_HEADER = "x-ha-dispatch-error-action";
 const STREAM_OPTIONS_UNSUPPORTED_SNIPPET = "unsupported parameter";
 const STREAM_OPTIONS_PARAM_NAME = "stream_options";
 const ATTEMPT_STREAM_USAGE_PARSE_TIMEOUT_MS = 1200;
@@ -73,13 +82,15 @@ type PreparedAttemptPayload = {
 
 type RetryConfigPayload = {
 	sleepMs?: number;
-	skipErrorCodes?: string[];
+	disableErrorCodes?: string[];
+	returnErrorCodes?: string[];
 	sleepErrorCodes?: string[];
 };
 
 type RetryConfig = {
 	sleepMs: number;
-	skipErrorCodeSet: Set<string>;
+	disableErrorCodeSet: Set<string>;
+	returnErrorCodeSet: Set<string>;
 	sleepErrorCodeSet: Set<string>;
 };
 
@@ -157,26 +168,16 @@ function normalizeRetryConfig(
 		Number.isFinite(sleepRaw) && sleepRaw >= 0 ? Math.floor(sleepRaw) : 0;
 	return {
 		sleepMs,
-		skipErrorCodeSet: new Set(
-			normalizeRetryErrorCodeList(payload?.skipErrorCodes),
+		disableErrorCodeSet: buildProxyErrorCodeSet(
+			normalizeRetryErrorCodeList(payload?.disableErrorCodes),
 		),
-		sleepErrorCodeSet: new Set(
+		returnErrorCodeSet: buildProxyErrorCodeSet(
+			normalizeRetryErrorCodeList(payload?.returnErrorCodes),
+		),
+		sleepErrorCodeSet: buildProxyErrorCodeSet(
 			normalizeRetryErrorCodeList(payload?.sleepErrorCodes),
 		),
 	};
-}
-
-function isNoAvailableChannelMessage(message: string | null): boolean {
-	const normalized = normalizeMessage(message)?.toLowerCase() ?? "";
-	if (!normalized) {
-		return false;
-	}
-	return (
-		normalized.includes("no available channel") ||
-		normalized.includes("无可用渠道") ||
-		normalized.includes("no available providers") ||
-		normalized.includes("无可用供应商")
-	);
 }
 
 function resolveRetryDecision(
@@ -184,31 +185,22 @@ function resolveRetryDecision(
 	errorCode: string | null,
 	errorMessage: string | null,
 ): {
-	shouldSkip: boolean;
+	action: "retry" | "sleep" | "disable" | "return";
 	sleepMs: number;
 } {
-	const normalizedCode = normalizeRetryErrorCode(errorCode);
-	const lookup: string[] = [];
-	if (
-		normalizedCode === "pond_hub_error" &&
-		isNoAvailableChannelMessage(errorMessage)
-	) {
-		lookup.push("model_not_found");
-	}
-	if (normalizedCode) {
-		lookup.push(normalizedCode);
-	}
-	for (const key of lookup) {
-		if (retryConfig.skipErrorCodeSet.has(key)) {
-			return { shouldSkip: true, sleepMs: 0 };
-		}
-	}
-	for (const key of lookup) {
-		if (retryConfig.sleepErrorCodeSet.has(key)) {
-			return { shouldSkip: false, sleepMs: retryConfig.sleepMs };
-		}
-	}
-	return { shouldSkip: false, sleepMs: 0 };
+	const action = resolveProxyErrorAction(
+		{
+			sleepErrorCodeSet: retryConfig.sleepErrorCodeSet,
+			disableErrorCodeSet: retryConfig.disableErrorCodeSet,
+			returnErrorCodeSet: retryConfig.returnErrorCodeSet,
+		},
+		errorCode,
+		errorMessage,
+	);
+	return {
+		action,
+		sleepMs: action === "sleep" ? retryConfig.sleepMs : 0,
+	};
 }
 
 async function fetchWithTimeout(
@@ -509,6 +501,7 @@ async function collectAttemptStreamMeta(
 	let firstTokenLatencyMs: number | null = null;
 	let streamMetaPartial = false;
 	let streamMetaReason: string | null = null;
+	let eventsSeen = 0;
 
 	if (!usage && shouldParseSuccessStreamUsage(mode)) {
 		const parsedStreamUsage = await parseUsageFromSse(response.clone(), {
@@ -519,6 +512,13 @@ async function collectAttemptStreamMeta(
 		if (parsedStreamUsage) {
 			usage = parsedStreamUsage.usage;
 			firstTokenLatencyMs = parsedStreamUsage.firstTokenLatencyMs;
+			eventsSeen = parsedStreamUsage.eventsSeen ?? 0;
+			if (parsedStreamUsage.abnormal) {
+				meta[ATTEMPT_STREAM_ERROR_CODE_HEADER] =
+					parsedStreamUsage.abnormal.errorCode;
+				meta[ATTEMPT_STREAM_ERROR_MESSAGE_HEADER] =
+					parsedStreamUsage.abnormal.errorMessage;
+			}
 			streamMetaPartial = shouldMarkStreamMetaPartial({
 				mode,
 				hasImmediateUsage: false,
@@ -544,6 +544,9 @@ async function collectAttemptStreamMeta(
 		}
 	}
 
+	if (eventsSeen > 0) {
+		meta[ATTEMPT_STREAM_EVENTS_SEEN_HEADER] = String(eventsSeen);
+	}
 	if (usage) {
 		meta["x-usage-total-tokens"] = String(usage.totalTokens);
 		meta["x-usage-prompt-tokens"] = String(usage.promptTokens);
@@ -633,12 +636,13 @@ async function executeSingleAttempt(
 	for (const [key, value] of body.headers ?? []) {
 		headers.set(key, value);
 	}
-	headers.delete("host");
-	headers.delete("content-length");
+	const sanitizedHeaders = sanitizeUpstreamRequestHeaders(headers);
+	sanitizedHeaders.delete("host");
+	sanitizedHeaders.delete("content-length");
 
 	const requestInit: RequestInit = {
 		method: body.method,
-		headers,
+		headers: sanitizedHeaders,
 		body: undefined,
 	};
 	let responsePath = body.responsePath?.trim() || body.target;
@@ -736,6 +740,7 @@ attempt.post("/dispatch", async (c) => {
 		attemptIndex: number;
 		channelId: string;
 	} | null = null;
+	const blockedChannelIds = new Set<string>();
 	for (
 		let attemptIndex = 0;
 		attemptIndex < attempts.length;
@@ -746,6 +751,9 @@ attempt.post("/dispatch", async (c) => {
 			continue;
 		}
 		const channelId = String(item.channelId ?? "");
+		if (channelId && blockedChannelIds.has(channelId)) {
+			continue;
+		}
 		let result = await executeSingleAttempt(item);
 		if (
 			item.streamOptionsInjected &&
@@ -777,11 +785,22 @@ attempt.post("/dispatch", async (c) => {
 				errorCode,
 				errorMessage,
 			);
-			if (decision.shouldSkip) {
+			if (decision.action === "return") {
 				return attachAttemptHeaders(result, body?.streamUsage, {
 					[DISPATCH_ATTEMPT_INDEX_HEADER]: String(attemptIndex),
 					[DISPATCH_CHANNEL_ID_HEADER]: channelId,
 					[DISPATCH_STOP_RETRY_HEADER]: "1",
+					[DISPATCH_ERROR_ACTION_HEADER]: "return",
+				});
+			}
+			if (decision.action === "disable") {
+				if (channelId) {
+					blockedChannelIds.add(channelId);
+				}
+				return attachAttemptHeaders(result, body?.streamUsage, {
+					[DISPATCH_ATTEMPT_INDEX_HEADER]: String(attemptIndex),
+					[DISPATCH_CHANNEL_ID_HEADER]: channelId,
+					[DISPATCH_ERROR_ACTION_HEADER]: "disable",
 				});
 			}
 			if (decision.sleepMs > 0) {
@@ -796,11 +815,9 @@ attempt.post("/dispatch", async (c) => {
 	const lastErrorMessage = await extractErrorMessage(
 		lastResult.result.response,
 	);
-	const shouldStopRetry = resolveRetryDecision(
-		retryConfig,
-		lastErrorCode,
-		lastErrorMessage,
-	).shouldSkip;
+	const shouldStopRetry =
+		resolveRetryDecision(retryConfig, lastErrorCode, lastErrorMessage)
+			.action === "return";
 	return attachAttemptHeaders(lastResult.result, body?.streamUsage, {
 		[DISPATCH_ATTEMPT_INDEX_HEADER]: String(lastResult.attemptIndex),
 		[DISPATCH_CHANNEL_ID_HEADER]: lastResult.channelId,

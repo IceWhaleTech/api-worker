@@ -28,7 +28,8 @@ type SettingsViewProps = {
 	backupImportFileName: string;
 	isBackupExporting: boolean;
 	isBackupImporting: boolean;
-	isBackupSyncing: boolean;
+	isBackupPushing: boolean;
+	isBackupPulling: boolean;
 	onSubmit: (event: Event) => void;
 	onFormChange: (patch: Partial<SettingsForm>) => void;
 	onBackupSettingsChange: (patch: Partial<BackupSettings>) => void;
@@ -36,7 +37,8 @@ type SettingsViewProps = {
 	onBackupImportModeChange: (mode: BackupImportMode) => void;
 	onBackupImportFileChange: (file: File | null) => void;
 	onBackupImport: () => void;
-	onBackupSyncNow: () => void;
+	onBackupPushNow: () => void;
+	onBackupPullNow: () => void;
 	onApplyRecommendedConfig: () => void;
 };
 
@@ -122,7 +124,8 @@ export const SettingsView = ({
 	backupImportFileName,
 	isBackupExporting,
 	isBackupImporting,
-	isBackupSyncing,
+	isBackupPushing,
+	isBackupPulling,
 	onSubmit,
 	onFormChange,
 	onBackupSettingsChange,
@@ -130,7 +133,8 @@ export const SettingsView = ({
 	onBackupImportModeChange,
 	onBackupImportFileChange,
 	onBackupImport,
-	onBackupSyncNow,
+	onBackupPushNow,
+	onBackupPullNow,
 	onApplyRecommendedConfig,
 }: SettingsViewProps) => {
 	const [openBackupSelectKey, setOpenBackupSelectKey] = useState<string | null>(
@@ -189,12 +193,26 @@ export const SettingsView = ({
 				all.add(normalized);
 			}
 		}
+		for (const code of settingsForm.proxy_retry_return_error_codes) {
+			const normalized = String(code ?? "").trim();
+			if (normalized) {
+				all.add(normalized);
+			}
+		}
+		for (const code of settingsForm.channel_permanent_disable_error_codes) {
+			const normalized = String(code ?? "").trim();
+			if (normalized) {
+				all.add(normalized);
+			}
+		}
 		return Array.from(all)
 			.sort((left, right) => left.localeCompare(right))
 			.map((code) => ({ value: code, label: code }));
 	}, [
 		retryErrorCodeOptions,
 		settingsForm.channel_disable_error_codes,
+		settingsForm.channel_permanent_disable_error_codes,
+		settingsForm.proxy_retry_return_error_codes,
 		settingsForm.proxy_retry_sleep_error_codes,
 	]);
 	const backupStatusLabel =
@@ -224,6 +242,15 @@ export const SettingsView = ({
 	const manualImportModeLabel =
 		backupImportModeOptions.find((option) => option.value === backupImportMode)
 			?.label ?? backupImportModeOptions[0].label;
+	const backupPendingLabel = backupSettings.pending_changes
+		? "有待备份变更"
+		: "本地与远端已同步";
+	const backupPendingClass = backupSettings.pending_changes
+		? "app-settings-backup-pill app-settings-backup-pill--warning"
+		: "app-settings-backup-pill app-settings-backup-pill--success";
+	const backupConfigLabel = backupSettings.config_ready
+		? "WebDAV 已就绪"
+		: "WebDAV 未配置完整";
 
 	useEffect(() => {
 		const handleDocumentClick = (event: MouseEvent) => {
@@ -331,10 +358,10 @@ export const SettingsView = ({
 						<div class="app-settings-row">
 							<div class="app-settings-row__main">
 								<span class="app-settings-row__label">
-									启用禁用渠道自动抽测恢复
+									启用已禁用站点自动恢复评估
 								</span>
 								<p class="app-settings-row__hint">
-									每天按设定时间探测禁用渠道，每个渠道随机选模型验证，成功后自动恢复
+									每天按设定时间对已禁用站点执行统一验证，只有通过真实服务验证才自动恢复
 								</p>
 							</div>
 							<div class="app-settings-row__switch">
@@ -352,10 +379,10 @@ export const SettingsView = ({
 									class="app-settings-row__label"
 									for="channel-recovery-probe-schedule-time"
 								>
-									抽测时间（中国时间）
+									评估时间（中国时间）
 								</label>
 								<p class="app-settings-row__hint">
-									每天执行禁用渠道抽测恢复任务的时间
+									每天执行已禁用站点评估恢复任务的时间
 								</p>
 							</div>
 							<Input
@@ -509,10 +536,33 @@ export const SettingsView = ({
 						<div class="app-settings-row app-settings-row--stack">
 							<div class="app-settings-row__main">
 								<span class="app-settings-row__label">
-									触发渠道禁用的错误码
+									不重试直接返回的错误码
 								</span>
 								<p class="app-settings-row__hint">
-									命中后会累计禁用次数并执行临时禁用
+									命中后立即返回错误，不再继续本地重试
+								</p>
+							</div>
+							<MultiSelect
+								class="app-settings-row__control app-settings-row__control--full"
+								options={mergedRetryErrorCodeOptions}
+								value={settingsForm.proxy_retry_return_error_codes}
+								placeholder="选择直接返回的错误码"
+								searchPlaceholder="搜索错误码"
+								emptyLabel="暂无可选错误码"
+								onChange={(next) => {
+									onFormChange({
+										proxy_retry_return_error_codes: next,
+									});
+								}}
+							/>
+						</div>
+						<div class="app-settings-row app-settings-row--stack">
+							<div class="app-settings-row__main">
+								<span class="app-settings-row__label">
+									触发临时封禁的错误码
+								</span>
+								<p class="app-settings-row__hint">
+									命中后会累计封禁次数，并按时长进入临时封禁
 								</p>
 							</div>
 							<MultiSelect
@@ -525,6 +575,29 @@ export const SettingsView = ({
 								onChange={(next) => {
 									onFormChange({
 										channel_disable_error_codes: next,
+									});
+								}}
+							/>
+						</div>
+						<div class="app-settings-row app-settings-row--stack">
+							<div class="app-settings-row__main">
+								<span class="app-settings-row__label">
+									触发永久封禁的错误码
+								</span>
+								<p class="app-settings-row__hint">
+									命中阈值后直接进入永久封禁，不再自动恢复
+								</p>
+							</div>
+							<MultiSelect
+								class="app-settings-row__control app-settings-row__control--full"
+								options={mergedRetryErrorCodeOptions}
+								value={settingsForm.channel_permanent_disable_error_codes}
+								placeholder="选择永久封禁的错误码"
+								searchPlaceholder="搜索错误码"
+								emptyLabel="暂无可选错误码"
+								onChange={(next) => {
+									onFormChange({
+										channel_permanent_disable_error_codes: next,
 									});
 								}}
 							/>
@@ -611,7 +684,7 @@ export const SettingsView = ({
 									渠道禁用阈值（次数）
 								</label>
 								<p class="app-settings-row__hint">
-									命中禁用错误码累计达到该次数后，将直接禁用渠道
+									命中封禁错误码累计达到该次数后，会按错误分类进入临时或永久封禁
 								</p>
 							</div>
 							<Input
@@ -825,7 +898,7 @@ export const SettingsView = ({
 					<div class="app-settings-group__header">
 						<h4 class="app-settings-group__title">站点任务</h4>
 						<p class="app-settings-group__caption">
-							配置站点测试、签到与恢复探测任务
+							配置站点验证、签到与恢复评估任务
 						</p>
 					</div>
 					<div class="app-settings-list app-settings-list--allow-overflow">
@@ -838,7 +911,7 @@ export const SettingsView = ({
 									站点任务并发上限
 								</label>
 								<p class="app-settings-row__hint">
-									控制批量签到和恢复探测时的并发执行数量
+									控制批量签到、批量验证与恢复评估时的并发执行数量
 								</p>
 							</div>
 							<Input
@@ -1047,11 +1120,12 @@ export const SettingsView = ({
 					<div class="app-settings-group__header">
 						<h4 class="app-settings-group__title">数据备份与同步</h4>
 						<p class="app-settings-group__caption">
-							全量导出（含敏感字段）与 WebDAV 同步
+							全量导出（含敏感字段）与 WebDAV 上传/下载
 						</p>
 					</div>
 					<div class="app-settings-backup-status-line">
 						<span class={backupStatusClass}>{backupStatusLabel}</span>
+						<span class={backupPendingClass}>{backupPendingLabel}</span>
 						<span class="app-settings-backup-status-text">
 							{backupSettings.last_sync_at
 								? new Date(backupSettings.last_sync_at).toLocaleString(
@@ -1077,17 +1151,36 @@ export const SettingsView = ({
 							variant="primary"
 							size="lg"
 							type="button"
-							disabled={isBackupSyncing}
-							onClick={onBackupSyncNow}
+							disabled={
+								!backupSettings.config_ready ||
+								isBackupPushing ||
+								isBackupPulling
+							}
+							onClick={onBackupPushNow}
 						>
-							{isBackupSyncing ? "同步中..." : "立即同步"}
+							{isBackupPushing ? "上传中..." : "立即上传"}
+						</Button>
+						<Button
+							variant="default"
+							size="lg"
+							type="button"
+							disabled={
+								!backupSettings.config_ready ||
+								isBackupPushing ||
+								isBackupPulling
+							}
+							onClick={onBackupPullNow}
+						>
+							{isBackupPulling ? "下载中..." : "立即下载"}
 						</Button>
 					</div>
 					<div class="app-settings-list app-settings-list--allow-overflow">
 						<div class="app-settings-row">
 							<div class="app-settings-row__main">
 								<span class="app-settings-row__label">启用定时备份</span>
-								<p class="app-settings-row__hint">每天按时间自动执行同步</p>
+								<p class="app-settings-row__hint">
+									启用后每天按时间执行计划同步；本地配置变更会尝试自动上传
+								</p>
 							</div>
 							<div class="app-settings-row__switch">
 								<Switch
@@ -1476,6 +1569,25 @@ export const SettingsView = ({
 										</Button>
 									</div>
 								</div>
+							</div>
+						</div>
+						<div class="app-settings-row app-settings-row--stack">
+							<div class="app-settings-row__main">
+								<span class="app-settings-row__label">备份配置状态</span>
+								<p class="app-settings-row__hint">
+									{backupConfigLabel}
+									{backupSettings.pending_at
+										? ` · 待备份时间 ${new Date(
+												backupSettings.pending_at,
+											).toLocaleString("zh-CN", { hour12: false })}`
+										: ""}
+								</p>
+								{!backupSettings.config_ready ? (
+									<p class="app-settings-row__hint">
+										需填写 WebDAV
+										地址、用户名和密码后，才能自动备份或手动上传/下载。
+									</p>
+								) : null}
 							</div>
 						</div>
 						<div class="app-settings-row app-settings-row--stack">

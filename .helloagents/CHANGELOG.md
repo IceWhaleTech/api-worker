@@ -4,6 +4,10 @@
 
 ### 变更
 
+- **[channels/sites/admin-ui/settings]**: 统一站点验证与恢复评估语义，验证结果改为阶段化输出并接入真实 provider-aware 服务验证链路 — by openclaw
+  - 方案: [202604042102_site-verification-system](plan/202604042102_site-verification-system/)
+  - 决策: site-verification-system#D001(统一站点验证语义并复用真实代理链路)
+
 - **[tooling/docs]**: 清理仓库内本地 unit/service 测试文件，保留 Playwright E2E，并同步校验链说明 — by openclaw
   - 方案: [202604031348_remove-all-test-files](archive/2026-04/202604031348_remove-all-test-files/)
   - 决策: remove-all-test-files#D001(删除本地 unit/service 测试，但保留 Playwright E2E)
@@ -17,6 +21,9 @@
   - 决策: startup-runtime-hardening#D001(Windows 自启动改用计划任务), startup-runtime-hardening#D002(运行时配置与日志统一收敛到 .dev)
 
 ### 修复
+
+- **[tooling]**: 修复 Linux `systemd --user` 自启动仍经由 `--bg` 二次派生导致开机状态误判，改为直接托管守护进程并增强 `autostart status` 运行态识别 — by openclaw
+  - 方案: [202604031515_linux-autostart-boot-fix](archive/2026-04/202604031515_linux-autostart-boot-fix/)
 
 - **[proxy/usage]**: 删除 stream usage 旁路解析的固定 `maxBytes` 截断，避免长 Responses 流在尾部 usage 到达前被误记为 `stream_meta_partial` — by lsy
   - 方案: [202604030046_remove-stream-usage-maxbytes](archive/2026-04/202604030046_remove-stream-usage-maxbytes/)

@@ -9,6 +9,7 @@ import {
 	repairOpenAiToolCallChain as repairOpenAiToolCallChainShared,
 	resolveLargeRequestOffload,
 	resolveStreamMetaPartialReason,
+	sanitizeUpstreamRequestHeaders,
 	shouldMarkStreamMetaPartial,
 	shouldParseFailureStreamUsage,
 	shouldParseSuccessStreamUsage,
@@ -31,6 +32,7 @@ import {
 import {
 	listCoolingDownChannelsForModel,
 	listVerifiedModelsByChannel,
+	recordChannelDisableHit,
 } from "../../../worker/src/services/channel-model-capabilities";
 import {
 	type ChannelRecord,
@@ -48,6 +50,11 @@ import {
 	writeHotJson,
 } from "../../../worker/src/services/hot-kv";
 import { shouldCooldown } from "../../../worker/src/services/model-cooldown";
+import {
+	buildProxyErrorCodeSet,
+	resolveProxyErrorAction,
+	type ProxyErrorAction,
+} from "../../../worker/src/services/proxy-error-policy";
 import {
 	applyGeminiModelToPath,
 	buildUpstreamChatRequest,
@@ -81,6 +88,8 @@ import {
 	parseUsageFromHeaders,
 	parseUsageFromJson,
 	parseUsageFromSse,
+	type StreamAbnormalSuccess,
+	type StreamUsage,
 	type StreamUsageMode,
 	type StreamUsageOptions,
 	StreamUsageParseError,
@@ -165,6 +174,7 @@ const ATTEMPT_BINDING_RESPONSE_PATH_HEADER = "x-ha-attempt-response-path";
 const ATTEMPT_BINDING_LATENCY_HEADER = "x-ha-attempt-latency-ms";
 const ATTEMPT_BINDING_UPSTREAM_REQUEST_ID_HEADER =
 	"x-ha-attempt-upstream-request-id";
+const ATTEMPT_DISPATCH_ERROR_ACTION_HEADER = "x-ha-dispatch-error-action";
 const ATTEMPT_ERROR_CODE_HEADER = "x-ha-attempt-error-code";
 const ATTEMPT_STREAM_USAGE_PROCESSED_HEADER =
 	"x-ha-attempt-stream-usage-processed";
@@ -172,6 +182,9 @@ const ATTEMPT_STREAM_FIRST_TOKEN_LATENCY_HEADER =
 	"x-ha-attempt-stream-first-token-latency-ms";
 const ATTEMPT_STREAM_META_PARTIAL_HEADER = "x-ha-attempt-stream-meta-partial";
 const ATTEMPT_STREAM_META_REASON_HEADER = "x-ha-attempt-stream-meta-reason";
+const ATTEMPT_STREAM_EVENTS_SEEN_HEADER = "x-ha-attempt-stream-events-seen";
+const ATTEMPT_STREAM_ERROR_CODE_HEADER = "x-ha-attempt-stream-error-code";
+const ATTEMPT_STREAM_ERROR_MESSAGE_HEADER = "x-ha-attempt-stream-error-message";
 const ATTEMPT_RESPONSE_ID_HEADER = "x-ha-attempt-response-id";
 const ATTEMPT_DISPATCH_INDEX_HEADER = "x-ha-dispatch-attempt-index";
 const ATTEMPT_DISPATCH_CHANNEL_ID_HEADER = "x-ha-dispatch-channel-id";
@@ -231,19 +244,88 @@ function normalizeMessage(value: string | null): string | null {
 	return trimmed;
 }
 
-function truncateMessage(value: string, maxLength: number): string {
-	if (value.length <= maxLength) {
-		return value;
-	}
-	return `${value.slice(0, Math.max(1, maxLength - 1))}…`;
-}
-
 function normalizeSummaryDetail(value: string, maxLength: number): string {
-	const compact = value.replace(/\s+/g, " ").trim();
-	if (!compact) {
+	void maxLength;
+	const normalized = value.trim();
+	if (!normalized) {
 		return "-";
 	}
-	return truncateMessage(compact, maxLength);
+	return normalized;
+}
+
+function redactHeaderValue(key: string, value: string): string {
+	const normalizedKey = key.trim().toLowerCase();
+	if (
+		normalizedKey === "authorization" ||
+		normalizedKey === "x-api-key" ||
+		normalizedKey === "x-goog-api-key" ||
+		normalizedKey === "proxy-authorization"
+	) {
+		return "[redacted]";
+	}
+	return value;
+}
+
+function snapshotHeaders(headers: Headers): Record<string, string> {
+	const entries = Array.from(headers.entries()).sort(([left], [right]) =>
+		left.localeCompare(right),
+	);
+	return Object.fromEntries(
+		entries.map(([key, value]) => [key, redactHeaderValue(key, value)]),
+	);
+}
+
+function extractEmbeddedHttpStatus(text: string): {
+	statusLine: string | null;
+	statusCode: number | null;
+	statusText: string | null;
+} {
+	const match = text.match(
+		/^(HTTP\/\d+(?:\.\d+)?\s+(\d{3})(?:\s+([^\r\n]+))?)/m,
+	);
+	if (!match) {
+		return {
+			statusLine: null,
+			statusCode: null,
+			statusText: null,
+		};
+	}
+	const parsedStatus = Number(match[2] ?? "");
+	return {
+		statusLine: match[1] ?? null,
+		statusCode: Number.isInteger(parsedStatus) ? parsedStatus : null,
+		statusText: normalizeStringField(match[3] ?? null),
+	};
+}
+
+function mergeErrorMetaJson(
+	base: string | null | undefined,
+	extra: Record<string, unknown>,
+): string | null {
+	const parsedBase = safeJsonParse<Record<string, unknown> | null>(
+		base ?? "",
+		null,
+	);
+	const merged = {
+		...(parsedBase ?? {}),
+		...extra,
+	};
+	return stringifyErrorMeta(merged);
+}
+
+function buildUpstreamDiagnosticMeta(options: {
+	target: string;
+	fallbackTarget?: string;
+	requestHeaders: Headers;
+	response: Response;
+}): Record<string, unknown> {
+	return {
+		upstream_target: options.target,
+		upstream_fallback_target: options.fallbackTarget ?? null,
+		request_headers: snapshotHeaders(options.requestHeaders),
+		response_status_text: normalizeStringField(options.response.statusText),
+		response_headers: snapshotHeaders(options.response.headers),
+	};
 }
 
 function buildAttemptFailureSummary(failures: AttemptFailureDetail[]): {
@@ -1351,16 +1433,12 @@ function formatUsageErrorMessage(
 	detail: string | null,
 	maxLength: number,
 ): string {
-	const safeMaxLength = Math.max(1, Math.floor(maxLength));
+	void maxLength;
 	const normalized = normalizeMessage(detail);
 	if (!normalized) {
 		return code;
 	}
-	const combined = `${code}: ${normalized}`;
-	if (combined.length <= safeMaxLength) {
-		return combined;
-	}
-	return `${combined.slice(0, safeMaxLength - 1)}…`;
+	return `${code}: ${normalized}`;
 }
 
 function stringifyErrorMeta(meta: Record<string, unknown>): string | null {
@@ -1444,54 +1522,6 @@ function sleep(delayMs: number): Promise<void> {
 	return new Promise((resolve) => {
 		setTimeout(resolve, safeDelay);
 	});
-}
-
-function normalizeRetryErrorCode(value: string | null): string {
-	return normalizeMessage(value)?.toLowerCase() ?? "";
-}
-
-function isNoAvailableChannelMessage(message: string | null): boolean {
-	const normalized = normalizeMessage(message)?.toLowerCase() ?? "";
-	if (!normalized) {
-		return false;
-	}
-	return (
-		normalized.includes("no available channel") ||
-		normalized.includes("无可用渠道") ||
-		normalized.includes("no available providers") ||
-		normalized.includes("无可用供应商")
-	);
-}
-
-function buildRetryErrorCodeSet(codes: string[]): Set<string> {
-	const normalized = codes
-		.map((code) => normalizeRetryErrorCode(code))
-		.filter((code) => code.length > 0);
-	return new Set(normalized);
-}
-
-function resolveRetryDecision(
-	sleepErrorCodeSet: Set<string>,
-	sleepMs: number,
-	errorCode: string | null,
-	errorMessage: string | null,
-): number {
-	const normalizedErrorCode = normalizeRetryErrorCode(errorCode);
-	const lookupKeys: string[] = [];
-	if (normalizedErrorCode === "pond_hub_error") {
-		if (isNoAvailableChannelMessage(errorMessage)) {
-			lookupKeys.push("model_not_found");
-		}
-	}
-	if (normalizedErrorCode) {
-		lookupKeys.push(normalizedErrorCode);
-	}
-	for (const key of lookupKeys) {
-		if (sleepErrorCodeSet.has(key)) {
-			return Math.max(0, Math.floor(sleepMs));
-		}
-	}
-	return 0;
 }
 
 function buildAttemptSequence(
@@ -1826,19 +1856,27 @@ async function extractErrorDetails(response: Response): Promise<{
 		return {
 			errorCode: null,
 			errorMessage: summarizeHtmlErrorPayload(normalizedText, response.status),
-			errorMetaJson: JSON.stringify({
+			errorMetaJson: stringifyErrorMeta({
 				type: "html_error",
 				status: response.status,
+				status_text: normalizeStringField(response.statusText),
+				response_headers: snapshotHeaders(response.headers),
 			}),
 		};
 	}
+	const embeddedHttp = extractEmbeddedHttpStatus(normalizedText);
 	return {
 		errorCode: null,
-		errorMessage: `upstream_text_error: status=${response.status}, detail=${normalizeSummaryDetail(
-			normalizedText,
-			UPSTREAM_ERROR_DETAIL_MAX_LENGTH,
-		)}`,
-		errorMetaJson: null,
+		errorMessage: `upstream_text_error: status=${response.status}, detail=${normalizeSummaryDetail(normalizedText, UPSTREAM_ERROR_DETAIL_MAX_LENGTH)}`,
+		errorMetaJson: stringifyErrorMeta({
+			type: "text_error",
+			status: response.status,
+			status_text: normalizeStringField(response.statusText),
+			response_headers: snapshotHeaders(response.headers),
+			embedded_http_status_line: embeddedHttp.statusLine,
+			embedded_http_status: embeddedHttp.statusCode,
+			embedded_http_status_text: embeddedHttp.statusText,
+		}),
 	};
 }
 
@@ -2026,7 +2064,7 @@ function buildUpstreamHeaders(
 	apiKey: string,
 	overrides: Record<string, string>,
 ): Headers {
-	const headers = new Headers(baseHeaders);
+	const headers = sanitizeUpstreamRequestHeaders(baseHeaders);
 	headers.delete("x-admin-token");
 	headers.delete("x-api-key");
 	if (provider === "openai") {
@@ -2075,7 +2113,8 @@ type AttemptDispatchRequest = {
 
 type DispatchRetryConfig = {
 	sleepMs: number;
-	skipErrorCodes: string[];
+	disableErrorCodes: string[];
+	returnErrorCodes: string[];
 	sleepErrorCodes: string[];
 };
 
@@ -2102,6 +2141,7 @@ type DispatchBindingSuccess = {
 	attemptIndex: number;
 	channelId: string | null;
 	stopRetry: boolean;
+	errorAction: ProxyErrorAction;
 };
 
 type AttemptBindingFailure = {
@@ -2181,6 +2221,17 @@ function parseOptionalLatencyHeader(value: string | null): number | null {
 	return Math.floor(parsed);
 }
 
+function parseOptionalCountHeader(value: string | null): number | null {
+	if (!value) {
+		return null;
+	}
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed < 0) {
+		return null;
+	}
+	return parsed;
+}
+
 function parseAttemptIndexHeader(value: string | null): number | null {
 	if (!value) {
 		return null;
@@ -2198,6 +2249,37 @@ function parseBooleanHeader(value: string | null): boolean {
 	}
 	const normalized = value.trim().toLowerCase();
 	return normalized === "1" || normalized === "true" || normalized === "yes";
+}
+
+function readAttemptStreamAbnormal(
+	headers: Headers,
+): StreamAbnormalSuccess | null {
+	const errorCode = normalizeMessage(
+		headers.get(ATTEMPT_STREAM_ERROR_CODE_HEADER),
+	);
+	if (!errorCode) {
+		return null;
+	}
+	return {
+		errorCode,
+		errorMessage:
+			normalizeMessage(headers.get(ATTEMPT_STREAM_ERROR_MESSAGE_HEADER)) ??
+			errorCode,
+		errorMetaJson: null,
+		eventType: null,
+	};
+}
+
+function parseErrorActionHeader(value: string | null): ProxyErrorAction {
+	const normalized = value?.trim().toLowerCase();
+	if (
+		normalized === "sleep" ||
+		normalized === "disable" ||
+		normalized === "return"
+	) {
+		return normalized;
+	}
+	return "retry";
 }
 
 type HeaderLookup = {
@@ -2520,6 +2602,9 @@ async function executeDispatchViaWorker(
 			stopRetry: parseBooleanHeader(
 				response.headers.get(ATTEMPT_DISPATCH_STOP_RETRY_HEADER),
 			),
+			errorAction: parseErrorActionHeader(
+				response.headers.get(ATTEMPT_DISPATCH_ERROR_ACTION_HEADER),
+			),
 		};
 	} catch (error) {
 		const errorMessage = normalizeMessage(
@@ -2601,15 +2686,26 @@ proxy.all("/*", tokenAuth, async (c) => {
 		0,
 		Math.floor(Number(runtimeSettings.retry_sleep_ms ?? 0)),
 	);
-	const retrySleepErrorCodeSet = buildRetryErrorCodeSet(
+	const retrySleepErrorCodeSet = buildProxyErrorCodeSet(
 		runtimeSettings.retry_sleep_error_codes ?? [],
 	);
-	const channelDisableErrorCodeSet = buildRetryErrorCodeSet(
+	const retryReturnErrorCodeSet = buildProxyErrorCodeSet(
+		runtimeSettings.retry_return_error_codes ?? [],
+	);
+	const channelDisableErrorCodeSet = buildProxyErrorCodeSet(
 		runtimeSettings.channel_disable_error_codes ?? [],
 	);
+	const channelPermanentDisableErrorCodeSet = buildProxyErrorCodeSet(
+		runtimeSettings.channel_permanent_disable_error_codes ?? [],
+	);
+	const disableActionErrorCodeSet = new Set([
+		...channelDisableErrorCodeSet,
+		...channelPermanentDisableErrorCodeSet,
+	]);
 	const dispatchRetryConfig: DispatchRetryConfig = {
 		sleepMs: retrySleepMs,
-		skipErrorCodes: [],
+		disableErrorCodes: Array.from(disableActionErrorCodeSet),
+		returnErrorCodes: Array.from(retryReturnErrorCodeSet),
 		sleepErrorCodes: Array.from(retrySleepErrorCodeSet),
 	};
 	const attemptBindingPolicy: AttemptBindingPolicy = {
@@ -2715,19 +2811,18 @@ proxy.all("/*", tokenAuth, async (c) => {
 			: requestText;
 		return parsedBody;
 	};
+	const rawRequestModel = extractModelFromRawJsonRequest(requestText);
 	const modelProbeBody =
 		parsedBody ??
-		(shouldSkipHeavyBodyParsing
-			? (() => {
-					const model = extractModelFromRawJsonRequest(requestText);
-					return model ? ({ model } as Record<string, unknown>) : null;
-				})()
+		(rawRequestModel
+			? ({ model: rawRequestModel } as Record<string, unknown>)
 			: null);
-	const downstreamModel = parseDownstreamModel(
+	const parsedDownstreamModel = parseDownstreamModel(
 		downstreamProvider,
 		requestPath,
 		modelProbeBody,
 	);
+	const downstreamModel = parsedDownstreamModel ?? rawRequestModel;
 	const inferredStream =
 		shouldSkipHeavyBodyParsing && requestText
 			? detectStreamFlagFromRawJsonRequest(requestText)
@@ -2969,7 +3064,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 		const selectionNowSeconds = Math.floor(Date.now() / 1000);
 		const activeChannels = await db
 			.prepare(
-				"SELECT * FROM channels WHERE status = ? AND (auto_disabled_until IS NULL OR auto_disabled_until <= ?)",
+				"SELECT * FROM channels WHERE status = ? AND COALESCE(auto_disabled_permanent, 0) = 0 AND (auto_disabled_until IS NULL OR auto_disabled_until <= ?)",
 			)
 			.bind("active", selectionNowSeconds)
 			.all<ChannelRecord>();
@@ -3311,6 +3406,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 	let selectedUpstreamModel: string | null = null;
 	let selectedRequestPath = targetPath;
 	let selectedImmediateUsage: NormalizedUsage | null = null;
+	let selectedParsedStreamUsage: StreamUsage | null = null;
 	let selectedHasUsageHeaders = false;
 	let selectedAttemptIndex: number | null = null;
 	let selectedAttemptStartedAt: string | null = null;
@@ -3318,6 +3414,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 	let selectedAttemptUpstreamRequestId: string | null = null;
 	let lastErrorDetails: ErrorDetails | null = null;
 	let attemptsExecuted = 0;
+	const blockedChannelIds = new Set<string>();
 	const parseStreamUsageOnFailure = async (response: Response) => {
 		if (
 			!isStream ||
@@ -3365,22 +3462,62 @@ proxy.all("/*", tokenAuth, async (c) => {
 			latencyMs: options.latencyMs,
 		});
 	};
-	const scheduleModelError = (options: {
+	const resolveFailureAction = (
+		errorCode: string | null,
+		errorMessage: string | null,
+	): ProxyErrorAction =>
+		resolveProxyErrorAction(
+			{
+				sleepErrorCodeSet: retrySleepErrorCodeSet,
+				disableErrorCodeSet: disableActionErrorCodeSet,
+				returnErrorCodeSet: retryReturnErrorCodeSet,
+			},
+			errorCode,
+			errorMessage,
+		);
+	const applyDisableAction = async (options: {
+		channelId: string;
+		errorCode: string;
+	}): Promise<void> => {
+		blockedChannelIds.add(options.channelId);
+		const normalizedErrorCode = options.errorCode.trim().toLowerCase();
+		const disableResult = await recordChannelDisableHit(
+			db,
+			options.channelId,
+			normalizedErrorCode,
+			{
+				disableDurationSeconds: channelDisableDurationSeconds,
+				disableThreshold: channelDisableThreshold,
+				permanentDisable:
+					channelPermanentDisableErrorCodeSet.has(normalizedErrorCode),
+			},
+			nowSeconds,
+		);
+		if (
+			disableResult.channelTempDisabled ||
+			disableResult.channelPermanentlyDisabled
+		) {
+			await invalidateSelectionHotCache(c.env.KV_HOT);
+		}
+	};
+	const scheduleModelCooldown = (options: {
 		channelId: string;
 		model: string | null;
 		upstreamStatus: number | null;
 		errorCode: string | null;
+		errorMessage: string | null;
 	}) => {
+		const action = resolveFailureAction(
+			options.errorCode,
+			options.errorMessage,
+		);
+		if (action === "disable" || action === "return") {
+			return;
+		}
 		if (!shouldCooldown(options.upstreamStatus, options.errorCode)) {
 			return;
 		}
-		const normalizedErrorCode = normalizeRetryErrorCode(options.errorCode);
-		const channelDisableMatched =
-			normalizedErrorCode.length > 0 &&
-			channelDisableErrorCodeSet.has(normalizedErrorCode);
-		const shouldRecordModelCooldown =
-			Boolean(options.model) && cooldownSeconds > 0;
-		if (!shouldRecordModelCooldown && !channelDisableMatched) {
+		if (!options.model || cooldownSeconds <= 0) {
 			return;
 		}
 		scheduleUsageEvent({
@@ -3393,33 +3530,33 @@ proxy.all("/*", tokenAuth, async (c) => {
 					(options.upstreamStatus === null
 						? ABNORMAL_SUCCESS_RESPONSE_ERROR_CODE
 						: String(options.upstreamStatus)),
-				cooldownSeconds: shouldRecordModelCooldown ? cooldownSeconds : 0,
+				cooldownSeconds,
 				cooldownFailureThreshold,
-				channelDisableMatched,
-				channelDisableDurationSeconds,
-				channelDisableThreshold,
 				nowSeconds,
 			},
 		});
 	};
 	const continueAfterFailure = async (
-		errorCode: string | null,
-		errorMessage: string | null,
 		attemptNumber: number,
+		action: ProxyErrorAction,
 	): Promise<boolean> => {
 		if (attemptNumber >= ordered.length) {
 			return false;
 		}
-		const decisionSleepMs = resolveRetryDecision(
-			retrySleepErrorCodeSet,
-			retrySleepMs,
-			errorCode,
-			errorMessage,
-		);
-		if (decisionSleepMs > 0) {
-			await sleep(decisionSleepMs);
+		if (action === "sleep" && retrySleepMs > 0) {
+			await sleep(retrySleepMs);
 		}
 		return true;
+	};
+	const buildDirectErrorResponse = (
+		status: number | null,
+		errorCode: string,
+	): Response => {
+		responseAttemptCount = attemptsExecuted;
+		const responseStatus = (
+			status !== null && status >= 400 ? status : 502
+		) as Parameters<typeof jsonError>[1];
+		return jsonErrorWithTrace(responseStatus, errorCode, errorCode);
 	};
 	const responsesToolCallMismatchChannels: string[] = [];
 	const streamOptionsCapabilityMemo = new Map<
@@ -3485,6 +3622,9 @@ proxy.all("/*", tokenAuth, async (c) => {
 		recordModel: string | null;
 		attemptStartedAt: string;
 		streamOptionsHandled: boolean;
+		target: string;
+		fallbackTarget?: string;
+		requestHeaders: Headers;
 	}> = [];
 	let dispatchHandled = false;
 	let dispatchStopRetry = false;
@@ -3697,6 +3837,9 @@ proxy.all("/*", tokenAuth, async (c) => {
 				recordModel,
 				attemptStartedAt,
 				streamOptionsHandled: shouldHandleStreamOptions,
+				target,
+				fallbackTarget,
+				requestHeaders: new Headers(headers),
 			});
 		}
 		if (dispatchAttempts.length > 0) {
@@ -3782,15 +3925,61 @@ proxy.all("/*", tokenAuth, async (c) => {
 							hasUsageJsonSignal = hasUsageJsonHint(data);
 							jsonUsage = parseUsageFromJson(data);
 						}
-						const immediateUsage = jsonUsage ?? headerUsage;
+						let immediateUsage = jsonUsage ?? headerUsage;
 						const immediateUsageSource = jsonUsage
 							? "json"
 							: headerUsage
 								? "header"
 								: "none";
+						const streamUsageProcessed = isStream
+							? parseBooleanHeader(
+									response.headers.get(ATTEMPT_STREAM_USAGE_PROCESSED_HEADER),
+								)
+							: false;
+						let parsedSuccessStreamUsage: StreamUsage | null = null;
+						if (isStream) {
+							if (streamUsageProcessed) {
+								parsedSuccessStreamUsage = {
+									usage: headerUsage,
+									firstTokenLatencyMs: parseOptionalLatencyHeader(
+										response.headers.get(
+											ATTEMPT_STREAM_FIRST_TOKEN_LATENCY_HEADER,
+										),
+									),
+									eventsSeen:
+										parseOptionalCountHeader(
+											response.headers.get(ATTEMPT_STREAM_EVENTS_SEEN_HEADER),
+										) ?? 0,
+									abnormal: readAttemptStreamAbnormal(response.headers),
+								};
+								if (parsedSuccessStreamUsage?.usage) {
+									immediateUsage = parsedSuccessStreamUsage.usage;
+								}
+							} else if (
+								shouldParseSuccessStreamUsage(
+									streamUsageMode as "full" | "lite" | "off",
+								)
+							) {
+								parsedSuccessStreamUsage = await parseUsageFromSse(
+									response.clone(),
+									{
+										...streamUsageOptions,
+										timeoutMs: streamUsageParseTimeoutMs,
+									},
+								).catch(() => null);
+								if (parsedSuccessStreamUsage?.usage) {
+									immediateUsage = parsedSuccessStreamUsage.usage;
+								}
+							}
+						}
 						const abnormalResponse =
+							parsedSuccessStreamUsage?.abnormal ??
 							(await detectAbnormalSuccessResponse(response)) ??
-							(isStream
+							(isStream &&
+							!parsedSuccessStreamUsage &&
+							shouldParseSuccessStreamUsage(
+								streamUsageMode as "full" | "lite" | "off",
+							)
 								? await detectAbnormalStreamSuccessResponse(response)
 								: null);
 						if (abnormalResponse) {
@@ -3837,27 +4026,38 @@ proxy.all("/*", tokenAuth, async (c) => {
 								errorMessage: abnormalResponse.errorMessage,
 								latencyMs: attemptLatencyMs,
 							});
-							scheduleModelError({
+							scheduleModelCooldown({
 								channelId: meta.channel.id,
 								model: meta.recordModel,
 								upstreamStatus: response.status,
 								errorCode: abnormalResponse.errorCode,
+								errorMessage: abnormalResponse.errorMessage,
 							});
 							if (downstreamModel && downstreamModel !== meta.recordModel) {
-								scheduleModelError({
+								scheduleModelCooldown({
 									channelId: meta.channel.id,
 									model: downstreamModel,
 									upstreamStatus: response.status,
 									errorCode: abnormalResponse.errorCode,
+									errorMessage: abnormalResponse.errorMessage,
 								});
 							}
-							if (
-								!(await continueAfterFailure(
+							const action = resolveFailureAction(
+								abnormalResponse.errorCode,
+								abnormalResponse.errorMessage,
+							);
+							if (action === "return") {
+								return buildDirectErrorResponse(
+									response.status,
 									abnormalResponse.errorCode,
-									abnormalResponse.errorMessage,
-									attemptNumber,
-								))
-							) {
+								);
+							}
+							if (action === "disable") {
+								await applyDisableAction({
+									channelId: meta.channel.id,
+									errorCode: abnormalResponse.errorCode,
+								});
+							} else if (!(await continueAfterFailure(attemptNumber, action))) {
 								dispatchStopRetry = true;
 							}
 						} else {
@@ -3915,12 +4115,23 @@ proxy.all("/*", tokenAuth, async (c) => {
 									errorMessage: usageMissingMessage,
 									latencyMs: attemptLatencyMs,
 								});
-								if (
-									!(await continueAfterFailure(
+								const action = resolveFailureAction(
+									usageMissingCode,
+									usageMissingMessage,
+								);
+								if (action === "return") {
+									return buildDirectErrorResponse(
+										response.status,
 										usageMissingCode,
-										usageMissingMessage,
-										attemptNumber,
-									))
+									);
+								}
+								if (action === "disable") {
+									await applyDisableAction({
+										channelId: meta.channel.id,
+										errorCode: usageMissingCode,
+									});
+								} else if (
+									!(await continueAfterFailure(attemptNumber, action))
 								) {
 									dispatchStopRetry = true;
 								}
@@ -3973,12 +4184,23 @@ proxy.all("/*", tokenAuth, async (c) => {
 									errorMessage: zeroCompletionMessage,
 									latencyMs: attemptLatencyMs,
 								});
-								if (
-									!(await continueAfterFailure(
+								const action = resolveFailureAction(
+									USAGE_ZERO_COMPLETION_TOKENS_ERROR_CODE,
+									zeroCompletionMessage,
+								);
+								if (action === "return") {
+									return buildDirectErrorResponse(
+										response.status,
 										USAGE_ZERO_COMPLETION_TOKENS_ERROR_CODE,
-										zeroCompletionMessage,
-										attemptNumber,
-									))
+									);
+								}
+								if (action === "disable") {
+									await applyDisableAction({
+										channelId: meta.channel.id,
+										errorCode: USAGE_ZERO_COMPLETION_TOKENS_ERROR_CODE,
+									});
+								} else if (
+									!(await continueAfterFailure(attemptNumber, action))
 								) {
 									dispatchStopRetry = true;
 								}
@@ -4022,6 +4244,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 								selectedResponse = response;
 								selectedRequestPath = responsePath;
 								selectedImmediateUsage = immediateUsage;
+								selectedParsedStreamUsage = parsedSuccessStreamUsage;
 								selectedHasUsageHeaders = hasUsageHeaderSignal;
 								selectedAttemptIndex = attemptNumber;
 								selectedAttemptStartedAt = meta.attemptStartedAt;
@@ -4042,6 +4265,15 @@ proxy.all("/*", tokenAuth, async (c) => {
 						}
 					} else {
 						const errorInfo = await extractErrorDetails(response);
+						const errorMetaJson = mergeErrorMetaJson(
+							errorInfo.errorMetaJson,
+							buildUpstreamDiagnosticMeta({
+								target: meta.target,
+								fallbackTarget: meta.fallbackTarget,
+								requestHeaders: meta.requestHeaders,
+								response,
+							}),
+						);
 						const failureUsage = await parseStreamUsageOnFailure(response);
 						const normalizedErrorCode = normalizeUpstreamErrorCode(
 							errorInfo.errorCode,
@@ -4069,7 +4301,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 							upstreamStatus: response.status,
 							errorCode: finalErrorCode,
 							errorMessage: normalizedErrorMessage,
-							errorMetaJson: errorInfo.errorMetaJson,
+							errorMetaJson,
 						};
 						recordAttemptUsage({
 							channelId: meta.channel.id,
@@ -4084,7 +4316,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 							failureStage: "upstream_response",
 							failureReason: finalErrorCode,
 							usageSource: failureUsage.usageSource,
-							errorMetaJson: errorInfo.errorMetaJson,
+							errorMetaJson,
 						});
 						recordAttemptLog({
 							attemptIndex: attemptNumber,
@@ -4112,17 +4344,32 @@ proxy.all("/*", tokenAuth, async (c) => {
 							errorMessage: normalizedErrorMessage,
 							latencyMs: attemptLatencyMs,
 						});
-						scheduleModelError({
+						scheduleModelCooldown({
 							channelId: meta.channel.id,
 							model: meta.recordModel,
 							upstreamStatus: response.status,
 							errorCode: finalErrorCode,
+							errorMessage: normalizedErrorMessage,
 						});
 						if (downstreamModel && downstreamModel !== meta.recordModel) {
-							scheduleModelError({
+							scheduleModelCooldown({
 								channelId: meta.channel.id,
 								model: downstreamModel,
 								upstreamStatus: response.status,
+								errorCode: finalErrorCode,
+								errorMessage: normalizedErrorMessage,
+							});
+						}
+						const action =
+							dispatchResult.errorAction !== "retry"
+								? dispatchResult.errorAction
+								: resolveFailureAction(finalErrorCode, normalizedErrorMessage);
+						if (action === "return") {
+							return buildDirectErrorResponse(response.status, finalErrorCode);
+						}
+						if (action === "disable") {
+							await applyDisableAction({
+								channelId: meta.channel.id,
 								errorCode: finalErrorCode,
 							});
 						}
@@ -4136,7 +4383,10 @@ proxy.all("/*", tokenAuth, async (c) => {
 	}
 	if (!dispatchHandled) {
 		for (const [attemptIndex, channel] of ordered.entries()) {
-			if (attemptIndex < attemptsExecuted) {
+			if (
+				attemptIndex < attemptsExecuted ||
+				blockedChannelIds.has(channel.id)
+			) {
 				continue;
 			}
 			const attemptNumber = attemptIndex + 1;
@@ -4420,13 +4670,26 @@ proxy.all("/*", tokenAuth, async (c) => {
 						errorMessage: attemptResult.errorMessage,
 						latencyMs: attemptResult.latencyMs,
 					});
-					if (
-						!(await continueAfterFailure(
+					const action = resolveFailureAction(
+						attemptResult.errorCode,
+						attemptResult.errorMessage,
+					);
+					if (action === "return") {
+						return buildDirectErrorResponse(
+							attemptResult.kind === "attempt_worker_error"
+								? attemptResult.httpStatus
+								: 503,
 							attemptResult.errorCode,
-							attemptResult.errorMessage,
-							attemptNumber,
-						))
-					) {
+						);
+					}
+					if (action === "disable") {
+						await applyDisableAction({
+							channelId: channel.id,
+							errorCode: attemptResult.errorCode,
+						});
+						continue;
+					}
+					if (!(await continueAfterFailure(attemptNumber, action))) {
 						break;
 					}
 					continue;
@@ -4529,13 +4792,26 @@ proxy.all("/*", tokenAuth, async (c) => {
 								errorMessage: retried.errorMessage,
 								latencyMs: retried.latencyMs,
 							});
-							if (
-								!(await continueAfterFailure(
+							const action = resolveFailureAction(
+								retried.errorCode,
+								retried.errorMessage,
+							);
+							if (action === "return") {
+								return buildDirectErrorResponse(
+									retried.kind === "attempt_worker_error"
+										? retried.httpStatus
+										: 503,
 									retried.errorCode,
-									retried.errorMessage,
-									attemptNumber,
-								))
-							) {
+								);
+							}
+							if (action === "disable") {
+								await applyDisableAction({
+									channelId: channel.id,
+									errorCode: retried.errorCode,
+								});
+								continue;
+							}
+							if (!(await continueAfterFailure(attemptNumber, action))) {
 								break;
 							}
 							continue;
@@ -4566,15 +4842,61 @@ proxy.all("/*", tokenAuth, async (c) => {
 						hasUsageJsonSignal = hasUsageJsonHint(data);
 						jsonUsage = parseUsageFromJson(data);
 					}
-					const immediateUsage = jsonUsage ?? headerUsage;
+					let immediateUsage = jsonUsage ?? headerUsage;
 					const immediateUsageSource = jsonUsage
 						? "json"
 						: headerUsage
 							? "header"
 							: "none";
+					const streamUsageProcessed = isStream
+						? parseBooleanHeader(
+								response.headers.get(ATTEMPT_STREAM_USAGE_PROCESSED_HEADER),
+							)
+						: false;
+					let parsedSuccessStreamUsage: StreamUsage | null = null;
+					if (isStream) {
+						if (streamUsageProcessed) {
+							parsedSuccessStreamUsage = {
+								usage: headerUsage,
+								firstTokenLatencyMs: parseOptionalLatencyHeader(
+									response.headers.get(
+										ATTEMPT_STREAM_FIRST_TOKEN_LATENCY_HEADER,
+									),
+								),
+								eventsSeen:
+									parseOptionalCountHeader(
+										response.headers.get(ATTEMPT_STREAM_EVENTS_SEEN_HEADER),
+									) ?? 0,
+								abnormal: readAttemptStreamAbnormal(response.headers),
+							};
+							if (parsedSuccessStreamUsage?.usage) {
+								immediateUsage = parsedSuccessStreamUsage.usage;
+							}
+						} else if (
+							shouldParseSuccessStreamUsage(
+								streamUsageMode as "full" | "lite" | "off",
+							)
+						) {
+							parsedSuccessStreamUsage = await parseUsageFromSse(
+								response.clone(),
+								{
+									...streamUsageOptions,
+									timeoutMs: streamUsageParseTimeoutMs,
+								},
+							).catch(() => null);
+							if (parsedSuccessStreamUsage?.usage) {
+								immediateUsage = parsedSuccessStreamUsage.usage;
+							}
+						}
+					}
 					const abnormalResponse =
+						parsedSuccessStreamUsage?.abnormal ??
 						(await detectAbnormalSuccessResponse(response)) ??
-						(isStream
+						(isStream &&
+						!parsedSuccessStreamUsage &&
+						shouldParseSuccessStreamUsage(
+							streamUsageMode as "full" | "lite" | "off",
+						)
 							? await detectAbnormalStreamSuccessResponse(response)
 							: null);
 					if (abnormalResponse) {
@@ -4621,27 +4943,40 @@ proxy.all("/*", tokenAuth, async (c) => {
 							errorMessage: abnormalResponse.errorMessage,
 							latencyMs: attemptLatencyMs,
 						});
-						scheduleModelError({
+						scheduleModelCooldown({
 							channelId: channel.id,
 							model: recordModel,
 							upstreamStatus: response.status,
 							errorCode: abnormalResponse.errorCode,
+							errorMessage: abnormalResponse.errorMessage,
 						});
 						if (downstreamModel && downstreamModel !== recordModel) {
-							scheduleModelError({
+							scheduleModelCooldown({
 								channelId: channel.id,
 								model: downstreamModel,
 								upstreamStatus: response.status,
 								errorCode: abnormalResponse.errorCode,
+								errorMessage: abnormalResponse.errorMessage,
 							});
 						}
-						if (
-							!(await continueAfterFailure(
+						const action = resolveFailureAction(
+							abnormalResponse.errorCode,
+							abnormalResponse.errorMessage,
+						);
+						if (action === "return") {
+							return buildDirectErrorResponse(
+								response.status,
 								abnormalResponse.errorCode,
-								abnormalResponse.errorMessage,
-								attemptNumber,
-							))
-						) {
+							);
+						}
+						if (action === "disable") {
+							await applyDisableAction({
+								channelId: channel.id,
+								errorCode: abnormalResponse.errorCode,
+							});
+							continue;
+						}
+						if (!(await continueAfterFailure(attemptNumber, action))) {
 							break;
 						}
 						continue;
@@ -4699,13 +5034,24 @@ proxy.all("/*", tokenAuth, async (c) => {
 							errorMessage: usageMissingMessage,
 							latencyMs: attemptLatencyMs,
 						});
-						if (
-							!(await continueAfterFailure(
+						const action = resolveFailureAction(
+							usageMissingCode,
+							usageMissingMessage,
+						);
+						if (action === "return") {
+							return buildDirectErrorResponse(
+								response.status,
 								usageMissingCode,
-								usageMissingMessage,
-								attemptNumber,
-							))
-						) {
+							);
+						}
+						if (action === "disable") {
+							await applyDisableAction({
+								channelId: channel.id,
+								errorCode: usageMissingCode,
+							});
+							continue;
+						}
+						if (!(await continueAfterFailure(attemptNumber, action))) {
 							break;
 						}
 						continue;
@@ -4759,13 +5105,24 @@ proxy.all("/*", tokenAuth, async (c) => {
 							errorMessage: zeroCompletionMessage,
 							latencyMs: attemptLatencyMs,
 						});
-						if (
-							!(await continueAfterFailure(
+						const action = resolveFailureAction(
+							USAGE_ZERO_COMPLETION_TOKENS_ERROR_CODE,
+							zeroCompletionMessage,
+						);
+						if (action === "return") {
+							return buildDirectErrorResponse(
+								response.status,
 								USAGE_ZERO_COMPLETION_TOKENS_ERROR_CODE,
-								zeroCompletionMessage,
-								attemptNumber,
-							))
-						) {
+							);
+						}
+						if (action === "disable") {
+							await applyDisableAction({
+								channelId: channel.id,
+								errorCode: USAGE_ZERO_COMPLETION_TOKENS_ERROR_CODE,
+							});
+							continue;
+						}
+						if (!(await continueAfterFailure(attemptNumber, action))) {
 							break;
 						}
 						continue;
@@ -4810,6 +5167,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 					selectedResponse = response;
 					selectedRequestPath = responsePath;
 					selectedImmediateUsage = immediateUsage;
+					selectedParsedStreamUsage = parsedSuccessStreamUsage;
 					selectedHasUsageHeaders = hasUsageHeaderSignal;
 					selectedAttemptIndex = attemptNumber;
 					selectedAttemptStartedAt = attemptStartedAt;
@@ -4830,6 +5188,15 @@ proxy.all("/*", tokenAuth, async (c) => {
 				}
 
 				const errorInfo = await extractErrorDetails(response);
+				const errorMetaJson = mergeErrorMetaJson(
+					errorInfo.errorMetaJson,
+					buildUpstreamDiagnosticMeta({
+						target,
+						fallbackTarget,
+						requestHeaders: headers,
+						response,
+					}),
+				);
 				const failureUsage = await parseStreamUsageOnFailure(response);
 				const normalizedErrorCode = normalizeUpstreamErrorCode(
 					errorInfo.errorCode,
@@ -4857,7 +5224,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 					upstreamStatus: response.status,
 					errorCode: finalErrorCode,
 					errorMessage: normalizedErrorMessage,
-					errorMetaJson: errorInfo.errorMetaJson,
+					errorMetaJson,
 				};
 				recordAttemptUsage({
 					channelId: channel.id,
@@ -4872,7 +5239,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 					failureStage: "upstream_response",
 					failureReason: finalErrorCode,
 					usageSource: failureUsage.usageSource,
-					errorMetaJson: errorInfo.errorMetaJson,
+					errorMetaJson,
 				});
 				recordAttemptLog({
 					attemptIndex: attemptNumber,
@@ -4901,27 +5268,37 @@ proxy.all("/*", tokenAuth, async (c) => {
 					latencyMs: attemptLatencyMs,
 				});
 
-				scheduleModelError({
+				scheduleModelCooldown({
 					channelId: channel.id,
 					model: recordModel,
 					upstreamStatus: response.status,
 					errorCode: finalErrorCode,
+					errorMessage: normalizedErrorMessage,
 				});
 				if (downstreamModel && downstreamModel !== recordModel) {
-					scheduleModelError({
+					scheduleModelCooldown({
 						channelId: channel.id,
 						model: downstreamModel,
 						upstreamStatus: response.status,
 						errorCode: finalErrorCode,
+						errorMessage: normalizedErrorMessage,
 					});
 				}
-				if (
-					!(await continueAfterFailure(
-						finalErrorCode,
-						normalizedErrorMessage,
-						attemptNumber,
-					))
-				) {
+				const action = resolveFailureAction(
+					finalErrorCode,
+					normalizedErrorMessage,
+				);
+				if (action === "return") {
+					return buildDirectErrorResponse(response.status, finalErrorCode);
+				}
+				if (action === "disable") {
+					await applyDisableAction({
+						channelId: channel.id,
+						errorCode: finalErrorCode,
+					});
+					continue;
+				}
+				if (!(await continueAfterFailure(attemptNumber, action))) {
 					break;
 				}
 			} catch (error) {
@@ -4987,27 +5364,37 @@ proxy.all("/*", tokenAuth, async (c) => {
 					latencyMs: attemptLatencyMs,
 				});
 
-				scheduleModelError({
+				scheduleModelCooldown({
 					channelId: channel.id,
 					model: recordModel,
 					upstreamStatus: null,
 					errorCode: usageErrorCode,
+					errorMessage: usageErrorMessage,
 				});
 				if (downstreamModel && downstreamModel !== recordModel) {
-					scheduleModelError({
+					scheduleModelCooldown({
 						channelId: channel.id,
 						model: downstreamModel,
 						upstreamStatus: null,
 						errorCode: usageErrorCode,
+						errorMessage: usageErrorMessage,
 					});
 				}
-				if (
-					!(await continueAfterFailure(
+				const action = resolveFailureAction(usageErrorCode, usageErrorMessage);
+				if (action === "return") {
+					return buildDirectErrorResponse(
+						isTimeout ? 504 : 502,
 						usageErrorCode,
-						usageErrorMessage,
-						attemptNumber,
-					))
-				) {
+					);
+				}
+				if (action === "disable") {
+					await applyDisableAction({
+						channelId: channel.id,
+						errorCode: usageErrorCode,
+					});
+					continue;
+				}
+				if (!(await continueAfterFailure(attemptNumber, action))) {
 					break;
 				}
 			}
@@ -5071,6 +5458,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 		let streamMetaPartial = false;
 		let streamMetaReason: string | null = null;
 		let firstTokenLatencyMs: number | null = null;
+		let eventsSeen = 0;
 		if (streamUsageProcessed) {
 			streamMetaPartial = parseBooleanHeader(
 				selectedResponse.headers.get(ATTEMPT_STREAM_META_PARTIAL_HEADER),
@@ -5082,6 +5470,30 @@ proxy.all("/*", tokenAuth, async (c) => {
 			firstTokenLatencyMs = parseOptionalLatencyHeader(
 				selectedResponse.headers.get(ATTEMPT_STREAM_FIRST_TOKEN_LATENCY_HEADER),
 			);
+			eventsSeen =
+				parseOptionalCountHeader(
+					selectedResponse.headers.get(ATTEMPT_STREAM_EVENTS_SEEN_HEADER),
+				) ?? 0;
+		} else if (selectedParsedStreamUsage) {
+			if (selectedParsedStreamUsage.usage) {
+				usage = selectedParsedStreamUsage.usage;
+				usageSource = "stream";
+			}
+			firstTokenLatencyMs = selectedParsedStreamUsage.firstTokenLatencyMs;
+			eventsSeen = selectedParsedStreamUsage.eventsSeen ?? 0;
+			streamMetaPartial = shouldMarkStreamMetaPartial({
+				mode: streamUsageMode as "full" | "lite" | "off",
+				hasImmediateUsage: Boolean(selectedImmediateUsage),
+				hasParsedUsage: Boolean(selectedParsedStreamUsage.usage),
+				eventsSeen,
+			});
+			if (streamMetaPartial) {
+				streamMetaReason = resolveStreamMetaPartialReason({
+					mode: streamUsageMode as "full" | "lite" | "off",
+					timedOut: selectedParsedStreamUsage.timedOut,
+					eventsSeen,
+				});
+			}
 		} else if (
 			shouldParseSuccessStreamUsage(streamUsageMode as "full" | "lite" | "off")
 		) {
@@ -5095,17 +5507,18 @@ proxy.all("/*", tokenAuth, async (c) => {
 					usageSource = "stream";
 				}
 				firstTokenLatencyMs = streamUsage.firstTokenLatencyMs;
+				eventsSeen = streamUsage.eventsSeen ?? 0;
 				streamMetaPartial = shouldMarkStreamMetaPartial({
 					mode: streamUsageMode as "full" | "lite" | "off",
 					hasImmediateUsage: Boolean(selectedImmediateUsage),
 					hasParsedUsage: Boolean(streamUsage.usage),
-					eventsSeen: streamUsage.eventsSeen,
+					eventsSeen,
 				});
 				if (streamMetaPartial) {
 					streamMetaReason = resolveStreamMetaPartialReason({
 						mode: streamUsageMode as "full" | "lite" | "off",
 						timedOut: streamUsage.timedOut,
-						eventsSeen: streamUsage.eventsSeen,
+						eventsSeen,
 					});
 				}
 			} catch {
@@ -5134,7 +5547,7 @@ proxy.all("/*", tokenAuth, async (c) => {
 			markStreamMetaPartial({
 				reason,
 				path: selectedRequestPath,
-				eventsSeen: 0,
+				eventsSeen,
 				hasImmediateUsage: Boolean(selectedImmediateUsage),
 				hasUsageHeaders: selectedHasUsageHeaders,
 			});

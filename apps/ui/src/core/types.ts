@@ -30,8 +30,90 @@ export type Site = {
 	last_checkin_status?: string | null;
 	last_checkin_message?: string | null;
 	last_checkin_at?: string | null;
+	verification?: SiteVerificationSummary | null;
 	created_at?: string | null;
 	updated_at?: string | null;
+};
+
+export type VerificationStageStatus = "pass" | "warn" | "fail" | "skip";
+
+export type VerificationVerdict =
+	| "serving"
+	| "degraded"
+	| "failed"
+	| "recoverable"
+	| "not_recoverable";
+
+export type VerificationSuggestedAction =
+	| "none"
+	| "retry"
+	| "fix_credentials"
+	| "fix_endpoint"
+	| "fix_model_config"
+	| "manual_review";
+
+export type VerificationStageResult = {
+	status: VerificationStageStatus;
+	code: string;
+	message: string;
+};
+
+export type SiteVerificationSummary = {
+	verdict: VerificationVerdict;
+	message: string;
+	checked_at: string;
+	suggested_action: VerificationSuggestedAction;
+	selected_model?: string | null;
+	stage_codes?: Record<string, string>;
+};
+
+export type SiteVerificationResult = {
+	site_id: string;
+	site_name: string;
+	mode: "service" | "recovery";
+	verdict: VerificationVerdict;
+	message: string;
+	suggested_action: VerificationSuggestedAction;
+	stages: {
+		connectivity: VerificationStageResult;
+		capability: VerificationStageResult;
+		service: VerificationStageResult;
+		recovery: VerificationStageResult;
+	};
+	selected_model: string | null;
+	selected_token: {
+		id?: string;
+		name?: string;
+	} | null;
+	discovered_models: string[];
+	token_summary: {
+		total: number;
+		success: number;
+		failed: number;
+	} | null;
+	trace: {
+		latency_ms?: number;
+		upstream_status?: number;
+		detail_code?: string;
+		detail_message?: string;
+	};
+	checked_at: string;
+};
+
+export type SiteVerificationBatchSummary = {
+	total: number;
+	serving: number;
+	degraded: number;
+	failed: number;
+	recoverable: number;
+	not_recoverable: number;
+	skipped: number;
+};
+
+export type SiteVerificationBatchReport = {
+	summary: SiteVerificationBatchSummary;
+	items: SiteVerificationResult[];
+	runs_at: string;
 };
 
 export type Token = {
@@ -129,7 +211,9 @@ export type Settings = {
 	channel_recovery_probe_schedule_time?: string;
 	proxy_model_failure_cooldown_minutes?: number;
 	proxy_model_failure_cooldown_threshold?: number;
+	proxy_retry_return_error_codes?: string[];
 	channel_disable_error_codes?: string[];
+	channel_permanent_disable_error_codes?: string[];
 	channel_disable_error_threshold?: number;
 	channel_disable_error_code_minutes?: number;
 	runtime_settings?: RuntimeProxySettings;
@@ -141,6 +225,8 @@ export type BackupSyncMode = "push" | "pull" | "two_way";
 export type BackupConflictPolicy = "local_wins" | "remote_wins";
 
 export type BackupImportMode = "merge" | "replace";
+
+export type BackupManualAction = "push" | "pull";
 
 export type BackupSettings = {
 	enabled: boolean;
@@ -157,6 +243,9 @@ export type BackupSettings = {
 	last_sync_at: string | null;
 	last_sync_status: "success" | "failed" | "idle";
 	last_sync_message: string | null;
+	pending_changes: boolean;
+	pending_at: string | null;
+	config_ready: boolean;
 };
 
 export type BackupSyncResult = {
@@ -198,7 +287,9 @@ export type RuntimeProxySettings = {
 	retry_max_retries: number;
 	retry_sleep_ms: number;
 	retry_sleep_error_codes: string[];
+	retry_return_error_codes: string[];
 	channel_disable_error_codes: string[];
+	channel_permanent_disable_error_codes: string[];
 	channel_disable_error_threshold: number;
 	channel_disable_error_code_minutes: number;
 	zero_completion_as_error_enabled: boolean;
@@ -293,7 +384,9 @@ export type SettingsForm = {
 	proxy_retry_max_retries: string;
 	proxy_retry_sleep_ms: string;
 	proxy_retry_sleep_error_codes: string[];
+	proxy_retry_return_error_codes: string[];
 	proxy_zero_completion_as_error_enabled: boolean;
+	channel_permanent_disable_error_codes: string[];
 	proxy_stream_usage_mode: string;
 	proxy_stream_usage_max_parsers: string;
 	proxy_stream_usage_parse_timeout_ms: string;
